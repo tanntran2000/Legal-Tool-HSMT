@@ -160,6 +160,12 @@ def validate_workflow(workflow):
     for name, job in jobs.items():
         require(type(job) is dict and job.get("name") == name, "stable check name required")
         require("permissions" not in job, "job-level permission overrides forbidden")
+        for value in job.get("env", {}).values():
+            if type(value) is str:
+                for expression in re.findall(r"\$\{\{(.*?)\}\}", value, flags=re.S):
+                    expression = re.sub(r"'(?:''|[^'])*'", "''", expression)
+                    require(re.search(r"(?<![\w.])runner\b", expression) is None,
+                            "runner context unavailable in job-level env")
         require(job.get("runs-on") == ("windows-2025" if name == "windows-native" else "ubuntu-24.04"), "runner changed")
         timeout = job.get("timeout-minutes")
         require(type(timeout) is int and 1 <= timeout <= 15, "bounded job timeout required")

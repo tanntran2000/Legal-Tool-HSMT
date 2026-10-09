@@ -32,9 +32,6 @@
       "name": "scope-policy",
       "runs-on": "ubuntu-24.04",
       "timeout-minutes": 8,
-      "env": {
-        "CI_OUTPUT_DIR": "${{ runner.temp }}/ltci/r/scope-policy"
-      },
       "steps": [
         {
           "name": "Record requested revisions",
@@ -59,6 +56,11 @@
             "architecture": "x64",
             "check-latest": false
           }
+        },
+        {
+          "name": "Initialize isolated runtime paths",
+          "shell": "bash",
+          "run": "printf 'CI_OUTPUT_DIR=%s/ltci/r/scope-policy\\n' \"$RUNNER_TEMP\" >> \"$GITHUB_ENV\""
         },
         {
           "name": "Record actual checkout and environment",
@@ -97,9 +99,6 @@
       "runs-on": "windows-2025",
       "timeout-minutes": 12,
       "env": {
-        "CI_OUTPUT_DIR": "${{ runner.temp }}/ltci/r/windows-native",
-        "WP01_STORAGE_TEST_RUNTIME": "${{ runner.temp }}/ltci/s",
-        "CW02_TEST_RUNTIME": "${{ runner.temp }}/ltci/p",
         "WP01_STORAGE_RUN_ID": "ci"
       },
       "steps": [
@@ -126,6 +125,11 @@
             "architecture": "x64",
             "check-latest": false
           }
+        },
+        {
+          "name": "Initialize isolated runtime paths",
+          "shell": "bash",
+          "run": "printf 'CI_OUTPUT_DIR=%s/ltci/r/windows-native\\n' \"$RUNNER_TEMP\" >> \"$GITHUB_ENV\"\nprintf 'WP01_STORAGE_TEST_RUNTIME=%s/ltci/s\\n' \"$RUNNER_TEMP\" >> \"$GITHUB_ENV\"\nprintf 'CW02_TEST_RUNTIME=%s/ltci/p\\n' \"$RUNNER_TEMP\" >> \"$GITHUB_ENV\""
         },
         {
           "name": "Record actual checkout and environment",
@@ -163,9 +167,6 @@
       "name": "linux-portable",
       "runs-on": "ubuntu-24.04",
       "timeout-minutes": 8,
-      "env": {
-        "CI_OUTPUT_DIR": "${{ runner.temp }}/ltci/r/linux-portable"
-      },
       "steps": [
         {
           "name": "Record requested revisions",
@@ -190,6 +191,11 @@
             "architecture": "x64",
             "check-latest": false
           }
+        },
+        {
+          "name": "Initialize isolated runtime paths",
+          "shell": "bash",
+          "run": "printf 'CI_OUTPUT_DIR=%s/ltci/r/linux-portable\\n' \"$RUNNER_TEMP\" >> \"$GITHUB_ENV\""
         },
         {
           "name": "Record actual checkout and environment",
@@ -228,7 +234,6 @@
       "runs-on": "ubuntu-24.04",
       "timeout-minutes": 8,
       "env": {
-        "CI_OUTPUT_DIR": "${{ runner.temp }}/ltci/r/ci-required",
         "CI_NEEDS_JSON": "${{ toJSON(needs) }}"
       },
       "steps": [
@@ -255,6 +260,11 @@
             "architecture": "x64",
             "check-latest": false
           }
+        },
+        {
+          "name": "Initialize isolated runtime paths",
+          "shell": "bash",
+          "run": "printf 'CI_OUTPUT_DIR=%s/ltci/r/ci-required\\n' \"$RUNNER_TEMP\" >> \"$GITHUB_ENV\""
         },
         {
           "name": "Record actual checkout and environment",

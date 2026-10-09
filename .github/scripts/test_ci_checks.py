@@ -194,6 +194,22 @@ class TestCIGates(unittest.TestCase):
         with self.assertRaises(ValueError):
             ci.validate_entry("tests/fixtures/expected.json", "100644", b"{}")
 
+    def test_job_env_rejects_runner_context(self):
+        good = ci.read_json(ROOT / ".github/workflows/ci.yml")
+        for job in good["jobs"]:
+            for expression in ["${{ runner.temp }}", "${{ runner['temp'] }}",
+                               "${{ format('{0}', runner.temp) }}"]:
+                bad = deepcopy(good)
+                bad["jobs"][job].setdefault("env", {})["UNSUPPORTED"] = expression
+                with self.assertRaisesRegex(ValueError, "runner.*job.*env"):
+                    ci.validate_workflow(bad)
+        # Literal text has no expression; step env supports runner per GitHub's table.
+        supported = deepcopy(good)
+        for job in supported["jobs"].values():
+            job["env"] = {"LITERAL": "runner.temp"}
+            job["steps"][0]["env"] = {"SUPPORTED": "${{ runner.temp }}"}
+        ci.validate_workflow(supported)
+
     def test_actual_workflow(self):
         ci.validate_workflow(ci.read_json(ROOT / ".github/workflows/ci.yml"))
 
