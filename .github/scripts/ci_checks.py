@@ -1,7 +1,7 @@
 """Small, fail-closed GitHub CI gates; standard library only."""
 import argparse
 import ast
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import contextmanager, nullcontext, redirect_stderr, redirect_stdout
 import gc
 import hashlib
 import importlib.metadata
@@ -15,6 +15,8 @@ import subprocess
 import sys
 import sysconfig
 import time
+import tempfile
+import urllib.request
 import unittest
 import warnings
 
@@ -77,6 +79,70 @@ def read_json(path):
         raise ValueError("missing/unreadable report: " + str(path)) from error
     require(len(raw) <= OUTPUT_CAP, "JSON report exceeds output cap")
     return decode_json(raw)
+
+
+
+HISTORICAL_STORAGE_COMMIT = "4563caf3e0ad28c1c64c07de94c4c19f48b2b8ac"
+HISTORICAL_STORAGE_SHA256 = "934aec19fce8e5960e42a64341b8d6635a0c56fa7aba23e7ab211d342f177ac9"
+HISTORICAL_STORAGE_URL = ("https://raw.githubusercontent.com/tanntran2000/Legal-Tool-HSMT/"
+                          + HISTORICAL_STORAGE_COMMIT + "/legal_tool/storage.py")
+
+
+class _NoHistoricalRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise ValueError("Historical source redirect is forbidden")
+
+
+def _fetch_historical_storage():
+    opener = urllib.request.build_opener(_NoHistoricalRedirect())
+    with opener.open(HISTORICAL_STORAGE_URL, timeout=15) as response:
+        require(response.status == 200, "Historical source HTTP status must be200")
+        require(response.geturl() == HISTORICAL_STORAGE_URL, "Historical source URL changed")
+        raw = response.read(80 * 1024 + 1)
+    require(len(raw) <= 80 * 1024, "Historical source exceeds80KiB read cap")
+    require(len(raw) == 48222, "Historical storage byte count mismatch")
+    require(hashlib.sha256(raw).hexdigest() == HISTORICAL_STORAGE_SHA256,
+            "Historical storage SHA256 mismatch")
+    return raw
+
+
+@contextmanager
+def native_test_inputs(report):
+    value = os.environ.get("RUNNER_TEMP")
+    require(value and Path(value).is_absolute(), "Native bootstrap requires absolute RUNNER_TEMP")
+    base = Path(value)
+    require(base.is_dir() and not base.is_symlink()
+            and not base.resolve().is_relative_to(ROOT.resolve()), "Unsafe native bootstrap runtime parent")
+    owned = tempfile.TemporaryDirectory(prefix="ltp-", dir=base)
+    keys = ("WP01_PREPARATION_TEST_RUNTIME", "WP01_PREPARATION_BEFORE_STORAGE", "CW02_TEST_RUNTIME")
+    prior = {key: os.environ.get(key) for key in keys}
+    try:
+        raw = _fetch_historical_storage()  # Verify pinned bytes before materializing/executing.
+        root = Path(owned.name)
+        previous = root / "previous.py"
+        previous.write_bytes(raw)
+        preparations = root / "p"
+        preparations.mkdir()
+        pdf_runtime = root / "pdf"  # Existing PDF setup requires a nonexistent path.
+        require(not pdf_runtime.exists(), "PDF runtime must start absent")
+        os.environ.update(zip(keys, map(str, (preparations, previous, pdf_runtime))))
+        report["historical_reader"] = dict(commit=HISTORICAL_STORAGE_COMMIT,
+            url=HISTORICAL_STORAGE_URL, bytes=len(raw), sha256=hashlib.sha256(raw).hexdigest(),
+            timeout_seconds=15, read_cap_bytes=80 * 1024)
+        yield
+    finally:
+        for key, original in prior.items():
+            if original is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = original
+        try:
+            owned.cleanup()
+            require(not Path(owned.name).exists(), "Owned native bootstrap root survived cleanup")
+        except Exception as error:
+            report["bootstrap_cleanup"] = "failed"
+            raise ValueError("Native bootstrap cleanup failed") from error
+        report["bootstrap_cleanup"] = "complete"
 
 
 def validate_inventory(expected_ids, discovered_ids, loader_errors):
@@ -361,7 +427,8 @@ def main():
         elif args.command == "tests":
             require(directory is not None, "test output directory is required")
             require_test_runtime(args.profile)
-            with warnings.catch_warnings(record=True) as discovery_warnings:
+            with (native_test_inputs(report) if args.profile == "windows-native" else nullcontext()), \
+                    warnings.catch_warnings(record=True) as discovery_warnings:
                 warnings.simplefilter("always", ResourceWarning)
                 try:
                     suite, expected, ids = collect_suite(args.profile)

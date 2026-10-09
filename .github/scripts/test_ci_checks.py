@@ -275,6 +275,112 @@ class TestCIGates(unittest.TestCase):
             ci.validate_inventory(windows, [x for x in windows if x not in required], [])
 
 
+    def test_native_bootstrap_owns_paths_and_restores_environment(self):
+        self.assertTrue(callable(getattr(ci, "native_test_inputs", None)))
+        keys = ("WP01_PREPARATION_TEST_RUNTIME", "WP01_PREPARATION_BEFORE_STORAGE", "CW02_TEST_RUNTIME")
+        prior = {key: "prior-" + key for key in keys}
+        with tempfile.TemporaryDirectory() as base, patch.dict(os.environ, {**prior, "RUNNER_TEMP": base}):
+            report = {}
+            with patch.object(ci, "_fetch_historical_storage", return_value=b"# unit retrieval fixture\n"):
+                with ci.native_test_inputs(report):
+                    owned = Path(os.environ[keys[0]]).parent
+                    self.assertEqual(owned.parent, Path(base))
+                    self.assertTrue(Path(os.environ[keys[0]]).is_dir())
+                    self.assertEqual(Path(os.environ[keys[1]]).read_bytes(), b"# unit retrieval fixture\n")
+                    self.assertFalse(Path(os.environ[keys[2]]).exists())
+                    self.assertEqual(Path(os.environ[keys[2]]).parent, owned)
+                self.assertFalse(owned.exists())
+            self.assertEqual({key: os.environ[key] for key in keys}, prior)
+            self.assertEqual(report["bootstrap_cleanup"], "complete")
+
+    def test_historical_retrieval_rejects_wrong_hash_before_materializing(self):
+        self.assertTrue(callable(getattr(ci, "_fetch_historical_storage", None)))
+        response = unittest.mock.MagicMock()
+        response.__enter__.return_value = response
+        response.status = 200
+        response.geturl.return_value = ci.HISTORICAL_STORAGE_URL
+        response.read.return_value = b"x" * 48222
+        opener = unittest.mock.MagicMock()
+        opener.open.return_value = response
+        with patch.object(ci.urllib.request, "build_opener", return_value=opener):
+            with self.assertRaisesRegex(ValueError, "SHA256"):
+                ci._fetch_historical_storage()
+        response.read.assert_called_once_with(80 * 1024 + 1)
+        opener.open.assert_called_once_with(ci.HISTORICAL_STORAGE_URL, timeout=15)
+
+    def test_historical_retrieval_refuses_oversize_status_and_redirect(self):
+        self.assertTrue(callable(getattr(ci, "_fetch_historical_storage", None)))
+        for status, url, body, diagnostic in [
+                (200, ci.HISTORICAL_STORAGE_URL, b"x" * (80 * 1024 + 1), "cap"),
+                (503, ci.HISTORICAL_STORAGE_URL, b"", "status"),
+                (200, "https://example.invalid/other", b"", "URL")]:
+            response = unittest.mock.MagicMock()
+            response.__enter__.return_value = response
+            response.status = status
+            response.geturl.return_value = url
+            response.read.return_value = body
+            opener = unittest.mock.MagicMock()
+            opener.open.return_value = response
+            with self.subTest(diagnostic=diagnostic), patch.object(ci.urllib.request, "build_opener", return_value=opener):
+                with self.assertRaisesRegex(ValueError, diagnostic):
+                    ci._fetch_historical_storage()
+        with self.assertRaisesRegex(ValueError, "redirect"):
+            ci._NoHistoricalRedirect().redirect_request(None, None, 302, "redirect", {}, "https://example.invalid/")
+
+    def test_native_bootstrap_retrieval_failure_cleans_and_restores(self):
+        self.assertTrue(callable(getattr(ci, "native_test_inputs", None)))
+        keys = ("WP01_PREPARATION_TEST_RUNTIME", "WP01_PREPARATION_BEFORE_STORAGE", "CW02_TEST_RUNTIME")
+        with tempfile.TemporaryDirectory() as base, patch.dict(os.environ, {"RUNNER_TEMP": base}):
+            for key in keys:
+                os.environ.pop(key, None)
+            with patch.object(ci, "_fetch_historical_storage", side_effect=TimeoutError("synthetic retrieval timeout")):
+                with self.assertRaises(TimeoutError):
+                    with ci.native_test_inputs({}):
+                        self.fail("Retrieval failure must prevent test execution")
+            self.assertEqual(list(Path(base).iterdir()), [])
+            self.assertTrue(all(key not in os.environ for key in keys))
+
+    def test_native_bootstrap_body_failure_cleans_and_restores(self):
+        self.assertTrue(callable(getattr(ci, "native_test_inputs", None)))
+        with tempfile.TemporaryDirectory() as base, patch.dict(os.environ, {"RUNNER_TEMP": base}):
+            before = {key: os.environ.get(key) for key in
+                      ("WP01_PREPARATION_TEST_RUNTIME", "WP01_PREPARATION_BEFORE_STORAGE", "CW02_TEST_RUNTIME")}
+            report = {}
+            with patch.object(ci, "_fetch_historical_storage", return_value=b"# unit retrieval fixture\n"):
+                with self.assertRaisesRegex(RuntimeError, "synthetic test failure"):
+                    with ci.native_test_inputs(report):
+                        raise RuntimeError("synthetic test failure")
+            self.assertEqual(list(Path(base).iterdir()), [])
+            self.assertEqual({key: os.environ.get(key) for key in before}, before)
+            self.assertEqual(report["bootstrap_cleanup"], "complete")
+
+    def test_native_bootstrap_cleanup_failure_fails_gate_and_restores(self):
+        self.assertTrue(callable(getattr(ci, "native_test_inputs", None)))
+        original = tempfile.TemporaryDirectory
+        allocated = []
+        def allocate(*args, **kwargs):
+            owned = original(*args, **kwargs)
+            cleanup = owned.cleanup
+            allocated.append((owned, cleanup))
+            owned.cleanup = lambda: (_ for _ in ()).throw(OSError("synthetic cleanup denied"))
+            return owned
+        with original() as base, patch.dict(os.environ, {"RUNNER_TEMP": base}):
+            before = {key: os.environ.get(key) for key in
+                      ("WP01_PREPARATION_TEST_RUNTIME", "WP01_PREPARATION_BEFORE_STORAGE", "CW02_TEST_RUNTIME")}
+            report = {}
+            try:
+                with patch.object(ci.tempfile, "TemporaryDirectory", side_effect=allocate), patch.object(
+                        ci, "_fetch_historical_storage", return_value=b"# unit retrieval fixture\n"):
+                    with self.assertRaisesRegex(ValueError, "cleanup"):
+                        with ci.native_test_inputs(report):
+                            pass
+                self.assertEqual({key: os.environ.get(key) for key in before}, before)
+                self.assertEqual(report["bootstrap_cleanup"], "failed")
+            finally:
+                for owned, cleanup in allocated:
+                    cleanup()
+
+
 def load_tests(loader, tests, pattern):
     return loader.loadTestsFromTestCase(TestCIGates)
 
