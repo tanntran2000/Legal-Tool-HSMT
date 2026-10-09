@@ -250,6 +250,31 @@ class TestCIGates(unittest.TestCase):
                 self.assertNotIn("PASS", result.stdout)
 
 
+    def test_preparation_module_has_approved_32k_cap(self):
+        self.assertIn("tests/test_preparations.py", ci.ALLOWED_FILES)
+        ci.validate_entry("tests/test_preparations.py", "100644", b"x = 1\n")
+        ci.validate_entry("tests/test_preparations.py", "100644", b"#" + b"x" * (32768 - 1))
+        with self.assertRaises(ValueError):
+            ci.validate_entry("tests/test_preparations.py", "100644", b"#" + b"x" * 32768)
+
+    def test_preparation_ids_are_required_only_in_windows_inventory(self):
+        import ast
+        path = ROOT / "tests/test_preparations.py"
+        tree = ast.parse(path.read_bytes())
+        required = {"tests.test_preparations." + cls.name + "." + method.name
+                    for cls in tree.body if isinstance(cls, ast.ClassDef) and not cls.name.startswith("_")
+                    for method in cls.body if isinstance(method, ast.FunctionDef) and method.name.startswith("test_")}
+        self.assertTrue(required)
+        windows = ci.expected_ids("windows-native")
+        portable = ci.expected_ids("linux-portable")
+        self.assertTrue(required <= set(windows))
+        self.assertFalse(required & set(portable))
+        self.assertEqual(len(windows), 119 + len(required))
+        self.assertEqual(len(portable), 20)
+        with self.assertRaises(ValueError):
+            ci.validate_inventory(windows, [x for x in windows if x not in required], [])
+
+
 def load_tests(loader, tests, pattern):
     return loader.loadTestsFromTestCase(TestCIGates)
 
