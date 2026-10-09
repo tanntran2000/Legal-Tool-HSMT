@@ -310,7 +310,7 @@ _sql_owners = threading.local()
 _sql_uncertain = set()
 
 class _SqlGate:
-    """Nonwaiting cooperative writers across Windows sessions, keyed by pinned root."""
+    """Nonwaiting cooperative writers in one supported Windows session, keyed by pinned root."""
     def __init__(self, root):
         self.root = root
         self.depth = 0
