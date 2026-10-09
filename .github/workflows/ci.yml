@@ -1,0 +1,288 @@
+{
+  "name": "Legal Tool CI",
+  "on": {
+    "pull_request": {
+      "types": [
+        "opened",
+        "synchronize",
+        "reopened",
+        "ready_for_review"
+      ]
+    }
+  },
+  "permissions": {
+    "contents": "read"
+  },
+  "concurrency": {
+    "group": "${{ github.workflow }}-${{ github.event.pull_request.number }}",
+    "cancel-in-progress": true
+  },
+  "env": {
+    "CI_HEAD_SHA": "${{ github.event.pull_request.head.sha }}",
+    "CI_BASE_SHA": "${{ github.event.pull_request.base.sha }}",
+    "PYTHONDONTWRITEBYTECODE": "1",
+    "PYTHONUTF8": "1",
+    "PYTHONWARNINGS": "default::ResourceWarning",
+    "GIT_CONFIG_COUNT": "1",
+    "GIT_CONFIG_KEY_0": "core.autocrlf",
+    "GIT_CONFIG_VALUE_0": "false"
+  },
+  "jobs": {
+    "scope-policy": {
+      "name": "scope-policy",
+      "runs-on": "ubuntu-24.04",
+      "timeout-minutes": 8,
+      "env": {
+        "CI_OUTPUT_DIR": "${{ runner.temp }}/ltci/r/scope-policy"
+      },
+      "steps": [
+        {
+          "name": "Record requested revisions",
+          "shell": "bash",
+          "run": "printf \"%s\\n\" \"Requested PR head: $CI_HEAD_SHA\" \"PR base: $CI_BASE_SHA\" \"Runner: $RUNNER_OS/$RUNNER_ARCH\" >> \"$GITHUB_STEP_SUMMARY\""
+        },
+        {
+          "name": "Checkout exact PR head",
+          "uses": "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+          "with": {
+            "repository": "${{ github.event.pull_request.head.repo.full_name }}",
+            "ref": "${{ github.event.pull_request.head.sha }}",
+            "persist-credentials": false,
+            "fetch-depth": 1
+          }
+        },
+        {
+          "name": "Python 3.13.16 x64, standard GIL",
+          "uses": "actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97",
+          "with": {
+            "python-version": "3.13.16",
+            "architecture": "x64",
+            "check-latest": false
+          }
+        },
+        {
+          "name": "Record actual checkout and environment",
+          "run": "python -X utf8 -B .github/scripts/ci_checks.py context"
+        },
+        {
+          "name": "Install unchanged parser dependency",
+          "run": "python -m pip install --disable-pip-version-check -r requirements-wp01.txt",
+          "timeout-minutes": 3
+        },
+        {
+          "name": "CI helper negative regressions",
+          "run": "python -X utf8 -B .github/scripts/test_ci_checks.py",
+          "timeout-minutes": 2
+        },
+        {
+          "name": "Required scope-policy",
+          "run": "python -X utf8 -B .github/scripts/ci_checks.py scope",
+          "timeout-minutes": 3
+        },
+        {
+          "name": "Retain bounded reports and test logs",
+          "if": "${{ always() }}",
+          "uses": "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9",
+          "with": {
+            "name": "ci-scope-policy-${{ github.event.pull_request.head.sha }}",
+            "path": "${{ env.CI_OUTPUT_DIR }}",
+            "if-no-files-found": "error",
+            "retention-days": 7
+          }
+        }
+      ]
+    },
+    "windows-native": {
+      "name": "windows-native",
+      "runs-on": "windows-2025",
+      "timeout-minutes": 12,
+      "env": {
+        "CI_OUTPUT_DIR": "${{ runner.temp }}/ltci/r/windows-native",
+        "WP01_STORAGE_TEST_RUNTIME": "${{ runner.temp }}/ltci/s",
+        "CW02_TEST_RUNTIME": "${{ runner.temp }}/ltci/p",
+        "WP01_STORAGE_RUN_ID": "ci"
+      },
+      "steps": [
+        {
+          "name": "Record requested revisions",
+          "shell": "bash",
+          "run": "printf \"%s\\n\" \"Requested PR head: $CI_HEAD_SHA\" \"PR base: $CI_BASE_SHA\" \"Runner: $RUNNER_OS/$RUNNER_ARCH\" >> \"$GITHUB_STEP_SUMMARY\""
+        },
+        {
+          "name": "Checkout exact PR head",
+          "uses": "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+          "with": {
+            "repository": "${{ github.event.pull_request.head.repo.full_name }}",
+            "ref": "${{ github.event.pull_request.head.sha }}",
+            "persist-credentials": false,
+            "fetch-depth": 1
+          }
+        },
+        {
+          "name": "Python 3.13.16 x64, standard GIL",
+          "uses": "actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97",
+          "with": {
+            "python-version": "3.13.16",
+            "architecture": "x64",
+            "check-latest": false
+          }
+        },
+        {
+          "name": "Record actual checkout and environment",
+          "run": "python -X utf8 -B .github/scripts/ci_checks.py context"
+        },
+        {
+          "name": "Install unchanged parser dependency",
+          "run": "python -m pip install --disable-pip-version-check -r requirements-wp01.txt",
+          "timeout-minutes": 3
+        },
+        {
+          "name": "Required windows-native",
+          "run": "python -X utf8 -B .github/scripts/ci_checks.py tests --profile windows-native",
+          "timeout-minutes": 8
+        },
+        {
+          "name": "Validate complete test report",
+          "run": "python -X utf8 -B .github/scripts/ci_checks.py validate-report --profile windows-native --report \"$CI_OUTPUT_DIR/tests.json\"",
+          "shell": "bash"
+        },
+        {
+          "name": "Retain bounded reports and test logs",
+          "if": "${{ always() }}",
+          "uses": "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9",
+          "with": {
+            "name": "ci-windows-native-${{ github.event.pull_request.head.sha }}",
+            "path": "${{ env.CI_OUTPUT_DIR }}",
+            "if-no-files-found": "error",
+            "retention-days": 7
+          }
+        }
+      ]
+    },
+    "linux-portable": {
+      "name": "linux-portable",
+      "runs-on": "ubuntu-24.04",
+      "timeout-minutes": 8,
+      "env": {
+        "CI_OUTPUT_DIR": "${{ runner.temp }}/ltci/r/linux-portable"
+      },
+      "steps": [
+        {
+          "name": "Record requested revisions",
+          "shell": "bash",
+          "run": "printf \"%s\\n\" \"Requested PR head: $CI_HEAD_SHA\" \"PR base: $CI_BASE_SHA\" \"Runner: $RUNNER_OS/$RUNNER_ARCH\" >> \"$GITHUB_STEP_SUMMARY\""
+        },
+        {
+          "name": "Checkout exact PR head",
+          "uses": "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+          "with": {
+            "repository": "${{ github.event.pull_request.head.repo.full_name }}",
+            "ref": "${{ github.event.pull_request.head.sha }}",
+            "persist-credentials": false,
+            "fetch-depth": 1
+          }
+        },
+        {
+          "name": "Python 3.13.16 x64, standard GIL",
+          "uses": "actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97",
+          "with": {
+            "python-version": "3.13.16",
+            "architecture": "x64",
+            "check-latest": false
+          }
+        },
+        {
+          "name": "Record actual checkout and environment",
+          "run": "python -X utf8 -B .github/scripts/ci_checks.py context"
+        },
+        {
+          "name": "Install unchanged parser dependency",
+          "run": "python -m pip install --disable-pip-version-check -r requirements-wp01.txt",
+          "timeout-minutes": 3
+        },
+        {
+          "name": "Required linux-portable",
+          "run": "python -X utf8 -B .github/scripts/ci_checks.py tests --profile linux-portable",
+          "timeout-minutes": 3
+        },
+        {
+          "name": "Validate complete test report",
+          "run": "python -X utf8 -B .github/scripts/ci_checks.py validate-report --profile linux-portable --report \"$CI_OUTPUT_DIR/tests.json\"",
+          "shell": "bash"
+        },
+        {
+          "name": "Retain bounded reports and test logs",
+          "if": "${{ always() }}",
+          "uses": "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9",
+          "with": {
+            "name": "ci-linux-portable-${{ github.event.pull_request.head.sha }}",
+            "path": "${{ env.CI_OUTPUT_DIR }}",
+            "if-no-files-found": "error",
+            "retention-days": 7
+          }
+        }
+      ]
+    },
+    "ci-required": {
+      "name": "ci-required",
+      "runs-on": "ubuntu-24.04",
+      "timeout-minutes": 8,
+      "env": {
+        "CI_OUTPUT_DIR": "${{ runner.temp }}/ltci/r/ci-required",
+        "CI_NEEDS_JSON": "${{ toJSON(needs) }}"
+      },
+      "steps": [
+        {
+          "name": "Record requested revisions",
+          "shell": "bash",
+          "run": "printf \"%s\\n\" \"Requested PR head: $CI_HEAD_SHA\" \"PR base: $CI_BASE_SHA\" \"Runner: $RUNNER_OS/$RUNNER_ARCH\" >> \"$GITHUB_STEP_SUMMARY\""
+        },
+        {
+          "name": "Checkout exact PR head",
+          "uses": "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+          "with": {
+            "repository": "${{ github.event.pull_request.head.repo.full_name }}",
+            "ref": "${{ github.event.pull_request.head.sha }}",
+            "persist-credentials": false,
+            "fetch-depth": 1
+          }
+        },
+        {
+          "name": "Python 3.13.16 x64, standard GIL",
+          "uses": "actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97",
+          "with": {
+            "python-version": "3.13.16",
+            "architecture": "x64",
+            "check-latest": false
+          }
+        },
+        {
+          "name": "Record actual checkout and environment",
+          "run": "python -X utf8 -B .github/scripts/ci_checks.py context"
+        },
+        {
+          "name": "Required ci-required",
+          "run": "python -X utf8 -B .github/scripts/ci_checks.py aggregate",
+          "timeout-minutes": 3
+        },
+        {
+          "name": "Retain bounded reports and test logs",
+          "if": "${{ always() }}",
+          "uses": "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9",
+          "with": {
+            "name": "ci-ci-required-${{ github.event.pull_request.head.sha }}",
+            "path": "${{ env.CI_OUTPUT_DIR }}",
+            "if-no-files-found": "error",
+            "retention-days": 7
+          }
+        }
+      ],
+      "if": "${{ always() }}",
+      "needs": [
+        "scope-policy",
+        "windows-native",
+        "linux-portable"
+      ]
+    }
+  }
+}
