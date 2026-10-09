@@ -5,12 +5,14 @@ from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timezone
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
 import shutil
 import sqlite3
 import threading
+from types import MappingProxyType
 from uuid import UUID, uuid4
 
 from . import pdf_read as pdf
@@ -25,7 +27,8 @@ _ERROR_CODES = frozenset(("INVALID_PACKAGE_ID", "INVALID_NAME", "INVALID_SOURCE_
     "ROOT_UNSAFE", "STORE_NOT_FOUND", "STORE_INVALID", "STORE_BUDGET_EXCEEDED", "DISK_SPACE_LIMIT",
     "PACKAGE_EXISTS", "PACKAGE_NOT_FOUND", "CONFIG_ERROR", "PATH_NOT_FOUND", "SOURCE_REFUSED",
     "FILE_SIZE_LIMIT", "DATABASE_BUSY", "IO_FAILED", "IMPORT_BUSY", "RECOVERY_HOLD", "INTEGRITY_HOLD",
-    "REPORT_CONTRACT_REJECTED", "VERSION_LIMIT", "PLATFORM_UNSUPPORTED"))
+    "REPORT_CONTRACT_REJECTED", "VERSION_LIMIT", "PLATFORM_UNSUPPORTED",
+    "PREPARATION_INVALID", "PREPARATION_CONFLICT", "PREPARATION_NOT_FOUND"))
 
 class StorageError(Exception):
     """Finite technical error; never legal approval or a repaired input report."""
@@ -282,9 +285,9 @@ def _directory_guard(path, create=False, anchor=None):
         for handle in reversed(handles):
             pdf.kernel32.CloseHandle(handle)
 
-def _budget(root, reserve=0):
+def _budget(root, reserve=0, *, reserve_entries=0):
     total = 0
-    entries = 0
+    entries = reserve_entries
     todo = [root]
     while todo:
         with os.scandir(todo.pop()) as items:
@@ -528,7 +531,7 @@ def _initialize_schema(db):
         db.execute("PRAGMA user_version=1")
 
 def _validate_schema(db):
-    """Prove the version-1 constraints without changing the persistent schema."""
+    """Prove separate supported v1/v2 constraints without persistent repair."""
     def unique_keys(connection, table):
         indexes = connection.execute('SELECT name FROM pragma_index_list(?) WHERE "unique"=1 AND partial=0', (table,))
         return {tuple(tuple(row) for row in connection.execute(
@@ -538,7 +541,23 @@ def _validate_schema(db):
     reference = sqlite3.connect(":memory:", isolation_level=None)
     try:
         _initialize_schema(reference)
-        for table in ("packages", "files", "import_journal"):
+        version = db.execute("PRAGMA user_version").fetchone()[0]
+        if version not in (1, 2):
+            raise StorageError("STORE_INVALID", "Unsupported schema version; no migration/repair")
+        tables = ("packages", "files", "import_journal")
+        if version == 2:
+            reference.execute(_PREPARATION_SQL)
+            tables += ("preparations",)
+        if db.execute("SELECT 1 FROM sqlite_master WHERE type IN('trigger','view') LIMIT 1").fetchone():
+            raise StorageError("STORE_INVALID", "Unsupported schema trigger/view; no migration/repair")
+        for table in tables:
+            shape = "SELECT cid,name,type,\"notnull\",dflt_value,pk FROM pragma_table_info(?)"
+            if [tuple(row) for row in db.execute(shape, (table,))] != [tuple(row) for row in reference.execute(shape, (table,))]:
+                raise StorageError("STORE_INVALID", "Unsupported schema columns: " + table + "; no migration/repair")
+            declaration = db.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
+            supported = reference.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
+            if declaration is None or _schema_checks(declaration[0]) != _schema_checks(supported[0]):
+                raise StorageError("STORE_INVALID", "Unsupported schema CHECK constraints: " + table + "; no migration/repair")
             query = 'SELECT "table","from","to",on_update,on_delete,"match" FROM pragma_foreign_key_list(?)'
             actual = {tuple(row) for row in db.execute(query, (table,))}
             expected = {tuple(row) for row in reference.execute(query, (table,))}
@@ -605,10 +624,12 @@ def _store(root, create=False):
                     _initialize_schema(db)
                 if db.execute("PRAGMA foreign_keys").fetchone()[0] != 1:
                     raise StorageError("STORE_INVALID", "Foreign keys must be enabled")
-                if db.execute("PRAGMA user_version").fetchone()[0] != 1:
+                version = db.execute("PRAGMA user_version").fetchone()[0]
+                if version not in (1, 2):
                     raise StorageError("STORE_INVALID", "Unsupported store schema; no migration/repair")
                 tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-                if tables != {"packages", "files", "import_journal"} or db.execute("PRAGMA foreign_key_check").fetchone():
+                expected_tables = {"packages", "files", "import_journal"} | ({"preparations"} if version == 2 else set())
+                if tables != expected_tables or db.execute("PRAGMA foreign_key_check").fetchone():
                     raise StorageError("STORE_INVALID", "Schema/foreign ownership is untrustworthy")
                 _validate_schema(db)
                 if db.execute("PRAGMA journal_mode").fetchone()[0].lower() != "delete":
@@ -940,3 +961,318 @@ def recover_imports(root: Path) -> RecoveryReport:
                         _phase(db, row["operation_id"], "HOLD", diagnostic, recovery_hold=True)
             entries.append(RecoveryItem(row["package_id"], row["operation_id"], outcome, diagnostic))
     return RecoveryReport(tuple(entries))
+
+MAX_PREPARATION_BYTES = 64 * 1024
+_PREPARATION_SQL = """CREATE TABLE preparations(
+    preparation_id TEXT PRIMARY KEY NOT NULL CHECK(length(preparation_id)=36),
+    package_uuid TEXT NOT NULL REFERENCES packages(package_uuid) ON DELETE RESTRICT,
+    payload_version INTEGER NOT NULL CHECK(typeof(payload_version)='integer' AND payload_version=1),
+    created_utc TEXT NOT NULL CHECK(length(CAST(created_utc AS BLOB)) BETWEEN 1 AND 64),
+    payload_json TEXT NOT NULL CHECK(length(CAST(payload_json AS BLOB)) BETWEEN 1 AND 65536),
+    payload_sha256 TEXT NOT NULL CHECK(length(payload_sha256)=64))"""
+
+
+@dataclass(frozen=True)
+class PreparationSnapshot:
+    package_id: str
+    preparation_id: str
+    payload_version: int
+    created_utc: str
+    payload_sha256: str
+    payload: object
+
+
+def _schema_checks(sql):
+    # Consume comments as tokens: commented-out constraints cannot prove admission.
+    tokens = re.findall(r"--[^\n]*|/\*[\s\S]*?\*/|'(?:''|[^'])*'|\"(?:\"\"|[^\"])*\"|"
+                        r"[A-Za-z_][A-Za-z_0-9]*|\d+|<>|<=|>=|!=|[^\s]", sql)
+    tokens = [t if t.startswith("'") else t.strip('"').lower() for t in tokens
+              if not t.startswith(("--", "/*"))]
+    checks = []
+    for i, token in enumerate(tokens):
+        if token != "check" or i + 1 == len(tokens) or tokens[i + 1] != "(":
+            continue
+        start, depth = i + 2, 1
+        for end in range(start, len(tokens)):
+            depth += (tokens[end] == "(") - (tokens[end] == ")")
+            if depth == 0:
+                checks.append(tuple(tokens[start:end]))
+                break
+        else:
+            raise StorageError("STORE_INVALID", "Unsupported schema CHECK declaration")
+    return sorted(checks)
+
+
+def _freeze_preparation(value):
+    if type(value) is dict:
+        return MappingProxyType({k: _freeze_preparation(v) for k, v in value.items()})
+    if type(value) is list:
+        return tuple(_freeze_preparation(v) for v in value)
+    return value
+
+
+def _preparation_payload(value):
+    """Closed version-1 wire payload; canonicalize only caller data, never saved bytes."""
+    def invalid(message):
+        raise StorageError("PREPARATION_INVALID", message)
+    remaining = 4096
+    def check(item, depth=0):
+        nonlocal remaining
+        remaining -= 1
+        if remaining < 0 or depth > 16:
+            invalid("JSON nodes/depth exceed bounded preparation")
+        kind = type(item)
+        if kind is dict:
+            if len(item) > 256:
+                invalid("Too many JSON keys")
+            for key, child in item.items():
+                raw = _utf8(key, "PREPARATION_INVALID")
+                if not 1 <= len(raw) <= 128 or "\x00" in key:
+                    invalid("Invalid bounded JSON key")
+                check(child, depth + 1)
+        elif kind is list:
+            if len(item) > 256:
+                invalid("Too many JSON list entries")
+            for child in item:
+                check(child, depth + 1)
+        elif kind is str:
+            if len(_utf8(item, "PREPARATION_INVALID")) > MAX_PREPARATION_BYTES:
+                invalid("String exceeds preparation envelope")
+        elif kind is int:
+            if not -(2**53 - 1) <= item <= 2**53 - 1:
+                invalid("JSON integer exceeds exact wire range")
+        elif kind is float:
+            if not math.isfinite(item):
+                invalid("Nonfinite JSON value")
+        elif kind not in (bool, type(None)):
+            invalid("Only exact JSON types are supported")
+    def keys(item, expected):
+        if type(item) is not dict or set(item) != set(expected):
+            invalid("Unsupported preparation fields")
+    check(value)
+    keys(value, ("payload_version", "checklist_row", "doc_refs", "source_spans"))
+    if type(value["payload_version"]) is not int or value["payload_version"] != 1:
+        invalid("Unsupported preparation payload version")
+    row = value["checklist_row"]
+    keys(row, ("name", "status", "next_action", "submission_summary"))
+    for field, limit in (("name", 200), ("status", 32), ("next_action", 2048), ("submission_summary", 2048)):
+        if type(row[field]) is not str or not row[field] or len(row[field]) > limit or "\x00" in row[field]:
+            invalid("Invalid checklist row " + field)
+    if row["status"] not in ("NEEDS_REVIEW", "PRESENT_UNCHECKED", "NOT_FOUND", "UNREADABLE", "CONFLICT", "NOT_APPLICABLE"):
+        invalid("Unsupported checklist status")
+    refs, spans = value["doc_refs"], value["source_spans"]
+    if type(refs) is not list or len(refs) > 8 or type(spans) is not list or len(spans) > 256:
+        invalid("Preparation reference/span count exceeds bounds")
+    for ref in refs:
+        keys(ref, ("package_id", "package_uuid", "file_id", "file_version", "sha256", "byte_count", "managed_relative_path"))
+    for span in spans:
+        keys(span, ("doc_ref", "page", "locator", "start", "end", "text"))
+    try:
+        text = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        if len(text.encode("utf-8")) > MAX_PREPARATION_BYTES:
+            invalid("Canonical preparation exceeds64KiB; no truncation")
+        return text, json.loads(text)
+    except StorageError:
+        raise
+    except (ValueError, TypeError, UnicodeError, RecursionError):
+        invalid("Preparation cannot encode as canonical UTF-8 JSON")
+
+
+def _preparation_uuid(value):
+    try:
+        return _uuid(value)
+    except StorageError:
+        raise StorageError("PREPARATION_INVALID", "Preparation ID must be a canonical UUID") from None
+
+
+def _preparation_write_admission(db):
+    active = db.execute("SELECT phase FROM import_journal WHERE phase IN('RESERVED','STAGED','RENAMED','HOLD') LIMIT 1").fetchone()
+    if active:
+        raise StorageError("RECOVERY_HOLD" if active[0] == "HOLD" else "IMPORT_BUSY",
+                           "Preparation writes require no active import in this store")
+
+
+def _preparation_budget(root, db, payload_bytes=0):
+    # Conservatively reserve new B-tree/overflow pages AND every old page's rollback image.
+    page_size = db.execute("PRAGMA page_size").fetchone()[0]
+    pages = db.execute("PRAGMA page_count").fetchone()[0]
+    if not 512 <= page_size <= 65536 or not 0 < pages <= MAX_STORE_BYTES // page_size:
+        raise StorageError("STORE_INVALID", "Untrustworthy database page budget")
+    growth = ((payload_bytes + page_size - 1) // page_size + 16) * page_size
+    _budget(root, growth + pages * (page_size + 8) + 65536, reserve_entries=1)
+
+
+def _preparation_sources(root, db, package, payload, pins):
+    """Verify each relevant owner; keep exact originals pinned through the SQL segment."""
+    owners = {package.package_id: package}
+    rows = []
+    for ref in payload["doc_refs"]:
+        try:
+            owner = _find_package(db, ref["package_id"])
+            _uuid(ref["file_id"])
+            if (ref["package_uuid"] != owner.package_uuid or type(ref["file_version"]) is not int
+                    or not 1 <= ref["file_version"] <= 2147483647 or type(ref["byte_count"]) is not int
+                    or not 1 <= ref["byte_count"] <= 20971520 or type(ref["sha256"]) is not str
+                    or re.fullmatch(r"[0-9a-f]{64}", ref["sha256"]) is None):
+                raise ValueError()
+            row = db.execute("SELECT * FROM files WHERE file_id=? AND package_uuid=?",
+                             (ref["file_id"], owner.package_uuid)).fetchone()
+            if row is None or any(not _same_wire_tree(ref[k], row[v]) for k, v in (
+                    ("file_version", "version"), ("sha256", "sha256"), ("byte_count", "byte_count"),
+                    ("managed_relative_path", "relative_path"))):
+                raise ValueError()
+            relative = "packages/" + owner.package_uuid + "/originals/" + ref["file_id"] + ".pdf"
+            if ref["managed_relative_path"] != relative:
+                raise ValueError()
+        except (StorageError, ValueError, TypeError):
+            raise StorageError("INTEGRITY_HOLD", "DocRef does not prove its managed owner/file/version/hash/bytes") from None
+        owners[owner.package_id] = owner
+        rows.append((owner, row, root / relative))
+    views = {}
+    for owner_id, owner in owners.items():
+        view = _view(root, db, owner)
+        if view.diagnostics:
+            raise StorageError("INTEGRITY_HOLD", "Relevant preparation owner is held: " + owner_id)
+        views[owner_id] = {record.file_id: record for record in view.files}
+    records = []
+    for owner, row, path in rows:
+        pins.enter_context(_directory_guard(path.parent, anchor=root))
+        handle = pdf.kernel32.CreateFileW(str(path), pdf.GENERIC_READ, pdf.FILE_SHARE_READ, None,
+                                         pdf.OPEN_EXISTING, 0x00200080, None)
+        if not handle or handle == pdf.INVALID_HANDLE_VALUE:
+            raise StorageError("INTEGRITY_HOLD", "Cannot pin referenced original against writes/replacement")
+        pins.callback(pdf.kernel32.CloseHandle, handle)
+        info = pdf.BY_HANDLE_FILE_INFORMATION()
+        if (not pdf.kernel32.GetFileInformationByHandle(handle, ctypes.byref(info))
+                or info.dwFileAttributes & 0x410 or info.nNumberOfLinks != 1
+                or pdf.kernel32.GetFileType(handle) != 1):
+            raise StorageError("INTEGRITY_HOLD", "Referenced original pin is not a single regular disk file")
+        _verify_original(path, row["byte_count"], row["sha256"], _decode_limits(row["limits_json"]))
+        records.append(views[owner.package_id][row["file_id"]])
+    for span in payload["source_spans"]:
+        try:
+            index, page_number, start, end = (span[k] for k in ("doc_ref", "page", "start", "end"))
+            if (any(type(x) is not int for x in (index, page_number, start, end))
+                    or not 0 <= index < len(records) or not 1 <= page_number <= 200
+                    or not 0 <= start < end or type(span["text"]) is not str
+                    or type(span["locator"]) is not str):
+                raise ValueError()
+            report = records[index].report
+            page = report.pages[page_number - 1]
+            if (not report.is_valid or page.page_index != page_number - 1 or page.state != "TEXT_EXTRACTABLE"
+                    or any(w.startswith("EXCERPT_TRUNCATED") for w in (*report.warnings, *page.warnings))
+                    or end > len(page.text) or span["locator"] != page.locator
+                    or span["text"] != page.text[start:end]):
+                raise ValueError()
+        except (AttributeError, IndexError, TypeError, ValueError):
+            raise StorageError("INTEGRITY_HOLD", "SourceSpan does not match complete persisted page/locator/text") from None
+
+
+def _preparation_row(db, preparation_id):
+    # Even corrupt rows written outside provider CHECKs cannot allocate an unbounded payload.
+    return db.execute("""SELECT substr(preparation_id,1,37) AS preparation_id,
+        substr(package_uuid,1,37) AS package_uuid, payload_version,
+        substr(created_utc,1,65) AS created_utc,
+        substr(CAST(payload_json AS BLOB),1,65537) AS payload_json,
+        substr(payload_sha256,1,65) AS payload_sha256
+        FROM preparations WHERE preparation_id=?""", (preparation_id,)).fetchone()
+
+
+def _preparation_decode(package, row):
+    try:
+        if row is None:
+            raise StorageError("PREPARATION_NOT_FOUND", "Saved preparation is absent for this package")
+        _uuid(row["preparation_id"])
+        if row["package_uuid"] != package.package_uuid:
+            raise StorageError("PREPARATION_NOT_FOUND", "Saved preparation belongs to another package")
+        if type(row["payload_version"]) is not int or row["payload_version"] != 1:
+            raise ValueError()
+        created = row["created_utc"]
+        stamp = datetime.fromisoformat(created)
+        if (len(_utf8(created, "INTEGRITY_HOLD")) > 64 or stamp.tzinfo is None
+                or stamp.utcoffset().total_seconds() != 0 or stamp.isoformat() != created):
+            raise ValueError()
+        raw = row["payload_json"]
+        if type(raw) is not bytes or not 1 <= len(raw) <= MAX_PREPARATION_BYTES:
+            raise ValueError()
+        def pairs(items):
+            value = {}
+            for key, child in items:
+                if key in value:
+                    raise ValueError()
+                value[key] = child
+            return value
+        def constant(value):
+            raise ValueError()
+        value = json.loads(raw.decode("utf-8"), object_pairs_hook=pairs, parse_constant=constant)
+        text, value = _preparation_payload(value)
+        digest = hashlib.sha256(raw).hexdigest()
+        if text.encode("utf-8") != raw or row["payload_sha256"] != digest:
+            raise ValueError()
+        return PreparationSnapshot(package.package_id, row["preparation_id"], 1, created,
+                                   digest, _freeze_preparation(value)), value
+    except StorageError as error:
+        if error.code == "PREPARATION_NOT_FOUND":
+            raise
+        raise StorageError("INTEGRITY_HOLD", "Saved preparation contract/checksum is untrustworthy; preserve snapshot") from None
+    except (ValueError, TypeError, UnicodeError, RecursionError):
+        raise StorageError("INTEGRITY_HOLD", "Saved preparation contract/checksum is untrustworthy; preserve snapshot") from None
+
+
+def upgrade_preparation_store(root: Path) -> int:
+    """Explicit, idempotent schema1->2 upgrade of an existing, quiescent admitted store."""
+    with _store(root) as (root, db), _transaction(db):
+        _preparation_write_admission(db)
+        packages = db.execute("SELECT * FROM packages").fetchmany(MAX_ENTRIES + 1)
+        if len(packages) > MAX_ENTRIES:
+            raise StorageError("STORE_BUDGET_EXCEEDED", "Upgrade package inventory exceeds bounds")
+        for row in packages:
+            if _view(root, db, _package(row)).diagnostics:
+                raise StorageError("INTEGRITY_HOLD", "Upgrade requires proved original/report ownership")
+        if db.execute("PRAGMA user_version").fetchone()[0] == 2:
+            return 2
+        _preparation_budget(root, db)
+        db.execute(_PREPARATION_SQL)
+        db.execute("PRAGMA user_version=2")
+    return 2
+
+
+def save_preparation(root: Path, package_id: str, preparation_id: str, payload) -> PreparationSnapshot:
+    """Append one bounded snapshot; canonical UUID retries never replace history."""
+    _validate_package_id(package_id)
+    _preparation_uuid(preparation_id)
+    text, value = _preparation_payload(payload)
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    with _store(root) as (root, db), ExitStack() as pins, _transaction(db):
+        if db.execute("PRAGMA user_version").fetchone()[0] != 2:
+            raise StorageError("CONFIG_ERROR", "Explicit upgrade_preparation_store is required; no auto migration")
+        package = _find_package(db, package_id)
+        _preparation_write_admission(db)
+        previous = _preparation_row(db, preparation_id)
+        if previous is not None:
+            if previous["package_uuid"] != package.package_uuid:
+                raise StorageError("PREPARATION_CONFLICT", "Preparation UUID already belongs to another package")
+            saved, old_value = _preparation_decode(package, previous)
+            if saved.payload_sha256 != digest or previous["payload_json"] != text.encode("utf-8"):
+                raise StorageError("PREPARATION_CONFLICT", "Preparation UUID already has different canonical content")
+            _preparation_sources(root, db, package, old_value, pins)
+            return saved
+        _preparation_sources(root, db, package, value, pins)
+        _preparation_budget(root, db, len(text.encode("utf-8")))
+        created = _now()
+        db.execute("INSERT INTO preparations VALUES(?,?,?,?,?,?)",
+                   (preparation_id, package.package_uuid, 1, created, text, digest))
+        return PreparationSnapshot(package_id, preparation_id, 1, created, digest, _freeze_preparation(value))
+
+
+def open_preparation(root: Path, package_id: str, preparation_id: str) -> PreparationSnapshot:
+    """Load exact saved data and prove managed sources, without external parsing or writes."""
+    _validate_package_id(package_id)
+    _preparation_uuid(preparation_id)
+    with _store(root) as (root, db), db.gate.hold(), ExitStack() as pins:
+        if db.execute("PRAGMA user_version").fetchone()[0] != 2:
+            raise StorageError("CONFIG_ERROR", "Explicit upgrade_preparation_store is required; no auto migration")
+        package = _find_package(db, package_id)
+        saved, value = _preparation_decode(package, _preparation_row(db, preparation_id))
+        _preparation_sources(root, db, package, value, pins)
+        return saved
