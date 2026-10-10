@@ -80,9 +80,9 @@ args = parser.parse_args()
 if sys.stdin.readline().strip() != 'PROCEED': sys.exit(2)
 page = dict(page_index=0, state='TEXT_EXTRACTABLE', text='OK', locator='page-1', warnings=[])
 report = dict(path=args.path, page_count=1, read_state='TEXT_EXTRACTABLE', pages=[page],
-              parser_version='pypdf/6.10.0', rule_version='wp01-v1',
+              parser_version='pypdf/6.10.0', rule_version='wp01-v2-dq',
               sha256=hashlib.sha256(open(args.path,'rb').read()).hexdigest(),
-              warnings=[], is_valid=True, excerpt='OK')
+              warnings=['D2;P=1;T=0;Q=0;M=0;I=0;U=0'], is_valid=True, excerpt='OK')
 mode = args.mode
 if mode == 'invalid_utf8_stdout':
     sys.stdout.buffer.write(json.dumps(report).encode('utf-8').replace(b'OK',b'\xff'));sys.exit(0)
@@ -100,6 +100,7 @@ elif mode == 'state_valid_inconsistency': report['read_state'] = 'LOCKED'
 elif mode == 'aggregate_page_warning':
     second = dict(page_index=1,state='TEXT_EXTRACTABLE',text='OK',locator='page-2',warnings=['W'*3000])
     page['warnings'] = ['W'*3000]; report.update(page_count=2,pages=[page,second],excerpt='OK\n\nOK')
+    report['warnings'] = ['D2;P=2;T=0;Q=0;M=0;I=0;U=0']
 elif mode == 'page_document_state_mismatch': report['read_state'] = 'MIXED'
 elif mode == 'invented_excerpt': report['excerpt'] = 'INVENTED'
 elif mode == 'invalid_failure_retained_pages': report.update(is_valid=False,read_state='LIMIT')
@@ -218,7 +219,7 @@ class TestPdfReadNegativeContracts(unittest.TestCase):
         self.assertIsInstance(report, ReadReport)
         self.assertEqual(report.read_state, "CORRUPT")
         self.assertEqual(report.parser_version, "pypdf/6.10.0")
-        self.assertEqual(report.rule_version, "wp01-v1")
+        self.assertEqual(report.rule_version, "wp01-v2-dq")
         self.assertFalse(report.is_valid)
 
     def test_unsupported_file_extension(self):
@@ -228,7 +229,7 @@ class TestPdfReadNegativeContracts(unittest.TestCase):
         self.assertIsInstance(report, ReadReport)
         self.assertEqual(report.read_state, "UNSUPPORTED")
         self.assertEqual(report.parser_version, "pypdf/6.10.0")
-        self.assertEqual(report.rule_version, "wp01-v1")
+        self.assertEqual(report.rule_version, "wp01-v2-dq")
 
     def test_corrupt_pdf_file(self):
         """Verify malformed PDF payload returns CORRUPT state without crash."""
@@ -237,7 +238,7 @@ class TestPdfReadNegativeContracts(unittest.TestCase):
         self.assertIsInstance(report, ReadReport)
         self.assertEqual(report.read_state, "CORRUPT")
         self.assertEqual(report.parser_version, "pypdf/6.10.0")
-        self.assertEqual(report.rule_version, "wp01-v1")
+        self.assertEqual(report.rule_version, "wp01-v2-dq")
         self.assertFalse(report.is_valid)
 
 
@@ -627,25 +628,40 @@ class TestR02Regressions(unittest.TestCase):
 
     # --- F5 / P2: Oracle execution acceptance gate ---
     def test_f5_native_oracle_acceptance(self):
-        """Match all16 direct/native fixture cases to the immutable independent oracle."""
-        oracle = json.loads((self.fixtures_dir / "expected.json").read_text(encoding="utf-8"))
-        for name,expected in oracle["fixtures"].items():
+        """Keep the frozen v1 facts and independently specify fresh-v2 diagnostics."""
+        oracle_path = self.fixtures_dir / "expected.json"
+        frozen_oracle = oracle_path.read_bytes()
+        oracle = json.loads(frozen_oracle)
+        self.assertEqual(oracle["oracle_version"], "wp01-v1")
+        self.assertEqual(oracle["rule_version"], "wp01-v1")
+        v2_diagnostics = {
+            "text_unicode.pdf": "D2;P=2;T=0;Q=0;M=0;I=0;U=0",
+            "image_only.pdf": "D2;P=1;T=0;Q=0;M=0;I=1;U=0",
+            "mixed.pdf": "D2;P=3;T=0;Q=0;M=1;I=1;U=1",
+        }
+        for name, expected in oracle["fixtures"].items():
             fixture = self.fixtures_dir / name
-            for engine in (inspect_pdf,inspect_bounded):
-                with self.subTest(fixture=name,engine=engine.__name__):
+            original = fixture.read_bytes()
+            for engine in (inspect_pdf, inspect_bounded):
+                with self.subTest(fixture=name, engine=engine.__name__):
                     report = engine(fixture)
-                    for field in ("read_state","page_count","is_valid","warnings"):
+                    for field in ("read_state", "page_count", "is_valid"):
                         if field in expected:self.assertEqual(getattr(report,field),expected[field],field)
-                    for field in ("parser_version","rule_version"):
-                        self.assertEqual(getattr(report,field),oracle[field],field)
-                    expected_hash = hashlib.sha256(fixture.read_bytes()).hexdigest() if fixture.suffix == ".pdf" else ""
-                    self.assertEqual(report.sha256,expected_hash,"captured/empty fixture identity")
+                    self.assertEqual(report.parser_version, oracle["parser_version"])
+                    self.assertEqual(report.rule_version, "wp01-v2-dq")
+                    warnings = [v2_diagnostics[name]] if expected["is_valid"] else expected["warnings"]
+                    self.assertEqual(report.warnings, warnings)
+                    expected_hash = hashlib.sha256(original).hexdigest() if fixture.suffix==".pdf" else ""
+                    self.assertEqual(report.sha256, expected_hash, "captured/empty fixture identity")
                     if "pages" in expected:
-                        self.assertEqual(len(report.pages),len(expected["pages"]))
-                        for page,exp_page in zip(report.pages,expected["pages"]):
-                            for field in ("page_index","locator","state","warnings"):
+                        self.assertEqual(len(report.pages), len(expected["pages"]))
+                        for page, exp_page in zip(report.pages, expected["pages"]):
+                            for field in ("page_index", "locator", "state"):
                                 if field in exp_page:self.assertEqual(getattr(page,field),exp_page[field],field)
+                            self.assertEqual(page.warnings, [])
                             for keyword in exp_page.get("expected_keywords",[]):self.assertIn(keyword,page.text)
+                    self.assertEqual(fixture.read_bytes(), original)
+        self.assertEqual(oracle_path.read_bytes(), frozen_oracle)
 
 
 class TestR03Regressions(unittest.TestCase):
@@ -874,33 +890,22 @@ class TestCW01Regressions(unittest.TestCase):
         self.assertEqual(native.sha256, direct.sha256)
 
     def test_cw01_global_warning_budget_direct_and_native(self):
-        """Verify many-warning PDF exceeding 4096-byte aggregate budget yields LIMIT_DIAGNOSTIC_BUDGET."""
+        """Compact producer diagnostics retain the same fifty blank pages."""
         many_pdf = CW01_RUNTIME_ROOT / "many_warnings.pdf"
         self.assertTrue(many_pdf.exists())
-
-        direct = inspect_pdf(many_pdf)
-        native = inspect_bounded(many_pdf)
-
-        for engine_name, report in [("direct", direct), ("native", native)]:
-            self.assertEqual(
-                report.read_state,
-                "LIMIT",
-                f"{engine_name} allowed report exceeding aggregate 4096-byte warning budget: {report.read_state}",
-            )
-            self.assertFalse(report.is_valid, f"{engine_name} marked over-budget report valid")
-            self.assertEqual(report.page_count, 50, f"{engine_name} failed to retain observed page_count")
-            self.assertEqual(len(report.pages), 0, f"{engine_name} retained pages on failure")
-            self.assertEqual(report.excerpt, "", f"{engine_name} retained excerpt on failure")
-            self.assertTrue(
-                any("LIMIT_DIAGNOSTIC_BUDGET" in w for w in report.warnings),
-                f"{engine_name} missing LIMIT_DIAGNOSTIC_BUDGET warning: {report.warnings}",
-            )
-            total_warning_bytes = sum(len(w.encode("utf-8")) for w in report.warnings)
-            self.assertLessEqual(
-                total_warning_bytes,
-                4096,
-                f"{engine_name} warning bytes {total_warning_bytes} exceeds 4096 byte cap",
-            )
+        source_hash = hashlib.sha256(many_pdf.read_bytes()).hexdigest()
+        direct, native = inspect_pdf(many_pdf), inspect_bounded(many_pdf)
+        for report in (direct, native):
+            self.assertTrue(report.is_valid, report.warnings)
+            self.assertEqual((report.read_state, report.page_count, len(report.pages)), ("UNKNOWN", 50, 50))
+            self.assertEqual(report.warnings, ["D2;P=50;T=0;Q=0;M=0;I=0;U=50"])
+            self.assertEqual(report.excerpt, "")
+            self.assertEqual(report.sha256, source_hash)
+            self.assertEqual([p.locator for p in report.pages], [f"page-{i+1}" for i in range(50)])
+            self.assertTrue(all(p.state=="UNKNOWN" and p.text=="" for p in report.pages))
+            self.assertLessEqual(pdf_read.calculate_aggregate_warning_bytes(report.warnings, report.pages), 4096)
+        self.assertEqual(pdf_read._report_to_wire(direct), pdf_read._report_to_wire(native))
+        self.assertEqual(hashlib.sha256(many_pdf.read_bytes()).hexdigest(), source_hash)
 
 
 def _assert_failed_read(test, report, state):
@@ -944,8 +949,8 @@ def _contract_packet(path, failure=False):
     page = dict(page_index=0,state="TEXT_EXTRACTABLE",text="OK",locator="page-1",warnings=[])
     return dict(path=str(path),page_count=0 if failure else 1,
                 read_state="LIMIT" if failure else "TEXT_EXTRACTABLE",pages=[] if failure else [page],
-                parser_version="pypdf/6.10.0",rule_version="wp01-v1",sha256="a"*64,
-                warnings=["TIMEOUT_LIMIT_EXCEEDED: deadline"] if failure else [],
+                parser_version="pypdf/6.10.0",rule_version="wp01-v2-dq",sha256="a"*64,
+                warnings=["TIMEOUT_LIMIT_EXCEEDED: deadline"] if failure else ["D2;P=1;T=0;Q=0;M=0;I=0;U=0"],
                 is_valid=not failure,excerpt="" if failure else "OK")
 
 
@@ -1068,8 +1073,8 @@ class CW02PortableContract(_ContractCase):
             self.assertEqual(pdf_read.publish_report(self.path,self.limits,wire,"a"*64,True).warnings,producer.warnings)
 
     def test_warning_budget_counts_multibyte_duplicates_and_separators(self):
-        packet = _contract_packet(self.path);packet["warnings"] = ["é"*1000]
-        packet["pages"][0]["warnings"] = ["é"*1000,"W"*94]
+        packet = _contract_packet(self.path);summary = packet["warnings"][0];packet["warnings"].append("é"*1000)
+        packet["pages"][0]["warnings"] = ["é"*1000,"W"*(94-len(summary.encode("utf-8"))-1)]
         self.assertEqual(len("\n".join(packet["warnings"]+packet["pages"][0]["warnings"]).encode("utf-8")),4096)
         for result in self.publish_both(packet):
             self.assertTrue(result.is_valid);self.assertEqual(result.pages[0].warnings,packet["pages"][0]["warnings"])
@@ -1092,11 +1097,11 @@ class CW02PortableContract(_ContractCase):
 
     def test_zero_unknown_and_exhausted_excerpt_text_pages_remain_valid(self):
         packets = []
-        packet = _contract_packet(self.path);packet.update(pages=[],page_count=0,read_state="UNKNOWN",excerpt="");packets.append(packet)
+        packet = _contract_packet(self.path);packet.update(pages=[],page_count=0,read_state="UNKNOWN",excerpt="",warnings=["D2;P=0;T=0;Q=0;M=0;I=0;U=0"]);packets.append(packet)
         packet = _contract_packet(self.path);packet.update(read_state="UNKNOWN",excerpt="")
-        packet["pages"][0].update(state="UNKNOWN",text="");packets.append(packet)
-        packet = _contract_packet(self.path);packet["pages"].append(dict(page_index=1,state="TEXT_EXTRACTABLE",text="",locator="page-2",warnings=["EXCERPT_TRUNCATED: exhausted"]))
-        packet["page_count"] = 2;packets.append(packet)
+        packet["pages"][0].update(state="UNKNOWN",text="");packet["warnings"]=["D2;P=1;T=0;Q=0;M=0;I=0;U=1"];packets.append(packet)
+        packet = _contract_packet(self.path);packet["pages"].append(dict(page_index=1,state="TEXT_EXTRACTABLE",text="",locator="page-2",warnings=["EXCERPT_TRUNCATED"]))
+        packet["page_count"] = 2;packet["warnings"]=["EXCERPT_TRUNCATED;D2;P=2;T=1;Q=0;M=0;I=0;U=0"];packets.append(packet)
         for packet in packets:
             for result in self.publish_both(packet):self.assertTrue(result.is_valid)
 
@@ -1242,3 +1247,260 @@ if os.name != "nt":
 
 if __name__ == "__main__":
     unittest.main()
+
+class ReaderDiagnosticTests(_ContractCase):
+    """Approved v2 diagnostics; synthetic data contains no legal oracle."""
+
+    def packet(self, pages=None, summary="D2;P=1;T=0;Q=0;M=0;I=0;U=0"):
+        pages = pages if pages is not None else [
+            dict(page_index=0, state="TEXT_EXTRACTABLE", text="OK",
+                 locator="page-1", warnings=[])]
+        return dict(path=str(self.path), page_count=len(pages),
+                    read_state=pdf_read.derive_document_state([PageReading(**p) for p in pages]),
+                    pages=pages, parser_version="pypdf/6.10.0", rule_version="wp01-v2-dq",
+                    sha256="a"*64, warnings=[summary], is_valid=True,
+                    excerpt="\n\n".join(p["text"] for p in pages if p["text"])[:100000])
+
+    def test_dense_warning_budget(self):
+        pages = [dict(page_index=i, state="UNKNOWN", text="", locator=f"page-{i+1}",
+                      warnings=["EXCERPT_TRUNCATED;Q"]) for i in range(200)]
+        expected = "EXCERPT_TRUNCATED;D2;P=200;T=200;Q=200;M=0;I=0;U=200"
+        packet = self.packet(pages, expected)
+        report = pdf_read.publish_report(self.path, self.limits, _packet_dto(packet), "a"*64)
+        self.assertTrue(report.is_valid, report.warnings)
+        self.assertEqual(len(report.pages), 200)
+        self.assertEqual(report.warnings, [expected])
+        self.assertLessEqual(pdf_read.calculate_aggregate_warning_bytes(report.warnings, report.pages), 4096)
+        self.assertEqual(len("\n".join(w for p in report.pages for w in p.warnings).encode()), 3999)
+        self.assertTrue(callable(getattr(pdf_read, "_diagnostic_summary", None)))
+        self.assertEqual(pdf_read._diagnostic_summary(report.pages), expected)
+
+    def test_duplicate_warning_guards(self):
+        duplicate = "same observed fact:" + "é"*1100
+        for placement in ("document", "page", "both"):
+            packet = self.packet()
+            if placement != "page":
+                packet["warnings"].extend([duplicate]* (2 if placement == "document" else 1))
+            if placement != "document":
+                packet["pages"][0]["warnings"] = [duplicate]* (2 if placement == "page" else 1)
+            original = deepcopy(packet)
+            with self.subTest(placement=placement):
+                report = pdf_read.publish_report(self.path, self.limits, packet, "a"*64, True)
+                self.assert_rejected([report])
+                self.assertIn("aggregate warning bytes", report.warnings[0])
+                self.assertEqual(packet, original)
+
+    def test_unknown_warning_overflow(self):
+        packet = self.packet()
+        packet["warnings"].extend(["observed external fact"]*2)
+        packet["pages"][0]["warnings"] = ["page fact", "page fact"]
+        kept = pdf_read.publish_report(self.path, self.limits, _packet_dto(packet), "a"*64)
+        self.assertTrue(kept.is_valid, kept.warnings)
+        self.assertEqual(kept.warnings, packet["warnings"])
+        self.assertEqual(kept.pages[0].warnings, packet["pages"][0]["warnings"])
+        packet["warnings"].append("é"*2100)
+        failed = pdf_read.publish_report(self.path, self.limits, _packet_dto(packet), "a"*64)
+        self.assertEqual((failed.read_state, failed.page_count, failed.sha256), ("LIMIT", 1, "a"*64))
+        self.assertEqual((failed.pages, failed.excerpt), ([], ""))
+        self.assertTrue(failed.warnings[0].startswith("LIMIT_DIAGNOSTIC_BUDGET:"))
+
+    def test_received_budget_no_repair(self):
+        for spelling in ("D2;malformed", "unknown fact"):
+            packet = self.packet()
+            packet["warnings"] = [spelling] + ["é"*1100]*2
+            original = json.dumps(packet, ensure_ascii=False).encode()
+            result = pdf_read.publish_report(self.path, self.limits, packet, "a"*64, True)
+            self.assert_rejected([result])
+            self.assertIn("aggregate warning bytes", result.warnings[0])
+            self.assertEqual(json.dumps(packet, ensure_ascii=False).encode(), original)
+        packet = self.packet()
+        packet["warnings"] = ["D2;malformed"]
+        result = pdf_read.publish_report(self.path, self.limits, packet, "a"*64, True)
+        self.assert_rejected([result])
+
+    def test_v2_counts_and_mixed_states(self):
+        pages = [dict(page_index=i, state=state, text="OK" if i<2 else "",
+                      locator=f"page-{i+1}", warnings=warnings)
+                 for i, (state, warnings) in enumerate([
+                     ("MIXED", ["EXCERPT_TRUNCATED;Q"]), ("TEXT_EXTRACTABLE", []),
+                     ("IMAGE_ONLY", []), ("UNKNOWN", ["TEXT_QUALITY"])])]
+        summary = "EXCERPT_TRUNCATED;D2;P=4;T=1;Q=2;M=1;I=1;U=1"
+        packet = self.packet(pages, summary)
+        good = pdf_read.publish_report(self.path, self.limits, deepcopy(packet), "a"*64, True)
+        self.assertTrue(good.is_valid, good.warnings)
+        self.assertEqual([p.state for p in good.pages], ["MIXED", "TEXT_EXTRACTABLE", "IMAGE_ONLY", "UNKNOWN"])
+        variants = [
+            summary.replace("P=4", "P=04"), summary.replace("Q=2", "Q=3"),
+            summary.replace("M=1", "M=0"), summary.removeprefix("EXCERPT_TRUNCATED;"),
+            summary.replace(";T=1;Q=2", ";Q=2;T=1"), summary+" ",
+            summary+";P=4"]
+        for invalid in variants:
+            bad = deepcopy(packet); bad["warnings"] = [invalid]
+            with self.subTest(summary=invalid):
+                self.assert_rejected([pdf_read.publish_report(self.path, self.limits, bad, "a"*64, True)])
+        for token in (["TEXT_QUALITY", "EXCERPT_TRUNCATED"],
+                      ["EXCERPT_TRUNCATED;Q"]*2, ["TEXT_QUALITY: verbose"],
+                      ["EXCERPT_TRUNCATED: verbose"], ["fact", "EXCERPT_TRUNCATED;Q"]):
+            bad = deepcopy(packet); bad["pages"][0]["warnings"] = token
+            with self.subTest(token=token):
+                self.assert_rejected([pdf_read.publish_report(self.path, self.limits, bad, "a"*64, True)])
+        bad = deepcopy(packet)
+        bad["pages"][1]["warnings"] = ["TEXT_QUALITY"]
+        bad["warnings"] = [summary.replace("Q=2", "Q=3")]
+        self.assert_rejected([pdf_read.publish_report(self.path, self.limits, bad, "a"*64, True)])
+
+    def test_legacy_decode_and_downgrade(self):
+        legacy = self.packet()
+        legacy.update(rule_version="wp01-v1", warnings=["legacy fact", "legacy fact"])
+        legacy["pages"][0]["warnings"] = ["EXCERPT_TRUNCATED: source omitted"]
+        fresh = pdf_read.publish_report(self.path, self.limits, deepcopy(legacy), "a"*64, True)
+        self.assert_rejected([fresh])
+        self.assertTrue(callable(getattr(pdf_read, "_publish_persisted_report", None)))
+        historical = pdf_read._publish_persisted_report(self.path, self.limits, deepcopy(legacy), "a"*64)
+        self.assertTrue(historical.is_valid)
+        self.assertEqual(pdf_read._report_to_wire(historical), legacy)
+        from legal_tool import storage
+        payload = json.dumps({k:v for k,v in legacy.items() if k!="path"},
+                             ensure_ascii=False, separators=(",", ":"))
+        original_hash = hashlib.sha256(payload.encode()).hexdigest()
+        decoded = storage._decode_report(self.path, payload, self.limits, "a"*64)
+        self.assertEqual(pdf_read._report_to_wire(decoded), legacy)
+        self.assertEqual(hashlib.sha256(payload.encode()).hexdigest(), original_hash)
+        with self.assertRaises(storage.StorageError) as rejected:
+            storage._encode_report(self.path, decoded, self.limits, "a"*64)
+        self.assertEqual(rejected.exception.code, "REPORT_CONTRACT_REJECTED")
+        for version in ("wp01-v0", "wp01-v3", "wp01-v2-dq.extra"):
+            bad = deepcopy(legacy); bad["rule_version"] = version
+            self.assert_rejected([pdf_read._publish_persisted_report(self.path, self.limits, bad, "a"*64)])
+        extra = self.packet(); extra["unreviewed_field"] = "not allowed"
+        self.assert_rejected([pdf_read.publish_report(self.path, self.limits, extra, "a"*64, True)])
+    def quality_pdf(self, text, image=False):
+        """Real CID mapping; generated witnesses contain synthetic text only."""
+        from pypdf.generic import (DictionaryObject as D, NameObject as N,
+                                   NumberObject as V, ArrayObject as A,
+                                   TextStringObject as S, DecodedStreamObject)
+        writer = pypdf.PdfWriter()
+        if image:
+            writer.append(str(Path(__file__).parent / "fixtures/image_only.pdf"), pages=(0, 1))
+            page = writer.pages[0]
+        else:
+            page = writer.add_blank_page(width=200, height=200)
+        cmap = DecodedStreamObject()
+        pairs = "\n".join(f"<{ord(c):04x}><{ord(c):04x}>" for c in sorted(set(text)))
+        cmap.set_data(("/CIDInit /ProcSet findresource begin 12 dict begin begincmap\n"
+                       "/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n"
+                       "/CMapName /R1 def /CMapType 2 def\n"
+                       "1 begincodespacerange <0000> <FFFF> endcodespacerange\n"
+                       f"{len(set(text))} beginbfchar\n{pairs}\nendbfchar\n"
+                       "endcmap CMapName currentdict /CMap defineresource pop end end").encode())
+        cid = D({N("/Type"):N("/Font"), N("/Subtype"):N("/CIDFontType2"),
+                 N("/BaseFont"):N("/R1Synthetic"), N("/DW"):V(1000),
+                 N("/CIDSystemInfo"):D({N("/Registry"):S("Adobe"),N("/Ordering"):S("Identity"),
+                                        N("/Supplement"):V(0)})})
+        font = D({N("/Type"):N("/Font"),N("/Subtype"):N("/Type0"),N("/BaseFont"):N("/R1Synthetic"),
+                  N("/Encoding"):N("/Identity-H"),N("/DescendantFonts"):A([writer._add_object(cid)]),
+                  N("/ToUnicode"):writer._add_object(cmap)})
+        resources = page.setdefault(N("/Resources"), D())
+        resources.setdefault(N("/Font"), D()).get_object()[N("/FQ")] = writer._add_object(font)
+        stream = DecodedStreamObject()
+        stream.set_data(("BT /FQ 12 Tf 10 100 Td <"+text.encode("utf-16-be").hex()+"> Tj ET").encode())
+        previous = page.get("/Contents")
+        page[N("/Contents")] = A((list(previous.get_object()) if previous and isinstance(previous.get_object(), A)
+                                else [previous] if previous else [])+[writer._add_object(stream)])
+        buffer = io.BytesIO();writer.write(buffer)
+        # Verify the controlled mapping rather than assuming that extraction preserves it.
+        self.assertEqual(pypdf.PdfReader(io.BytesIO(buffer.getvalue()), strict=True).pages[0].extract_text(), text)
+        return buffer.getvalue()
+
+    def quality_source(self, text, image=False):
+        _prepare_test_runtime()
+        number = getattr(self, "_quality_number", 0) + 1
+        self._quality_number = number
+        name = f"quality-{self._testMethodName}-{number}.pdf"
+        register = _TEST_RUNTIME / "runtime_register.json"
+        data = json.loads(register.read_text(encoding="utf-8"))
+        data["files"].append(dict(path=name, max_bytes=131072))
+        register.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        raw = self.quality_pdf(text, image)
+        self.assertLessEqual(len(raw), 131072)
+        path = _TEST_RUNTIME / name
+        with path.open("xb") as handle:handle.write(raw)
+        self.assertLessEqual(sum(p.stat().st_size for p in _TEST_RUNTIME.rglob("*") if p.is_file()), 33554432)
+        return path
+
+    def test_quality_image_token_matrix(self):
+        for text, image, state, token in [
+            ("Healthy synthetic text", False, "TEXT_EXTRACTABLE", []),
+            ("Good "+chr(1)*12, False, "UNKNOWN", ["TEXT_QUALITY"]),
+            ("Healthy synthetic text", True, "MIXED", []),
+            ("Good "+chr(1)*12, True, "MIXED", ["TEXT_QUALITY"]),
+            (chr(28)*8, False, "UNKNOWN", ["TEXT_QUALITY"]),
+            (chr(28)*8, True, "MIXED", ["TEXT_QUALITY"]),
+            ("", True, "IMAGE_ONLY", []), ("", False, "UNKNOWN", [])]:
+            with self.subTest(image=image, state=state):
+                report = inspect_pdf(self.quality_source(text, image))
+                self.assertTrue(report.is_valid, report.warnings)
+                self.assertEqual((report.pages[0].state, report.pages[0].warnings), (state, token))
+                self.assertEqual(report.pages[0].text, text)
+
+    def test_garbled_cid_quality(self):
+        text = "Synthetic CID "+chr(1)*16
+        source = self.quality_source(text)
+        before = source.read_bytes()
+        report = inspect_pdf(source)
+        self.assertEqual((report.read_state, report.pages[0].state), ("UNKNOWN", "UNKNOWN"))
+        self.assertEqual(report.pages[0].warnings, ["TEXT_QUALITY"])
+        self.assertEqual(report.warnings, ["D2;P=1;T=0;Q=1;M=0;I=0;U=1"])
+        self.assertEqual((report.excerpt, report.sha256), (text, hashlib.sha256(before).hexdigest()))
+        self.assertEqual(source.read_bytes(), before)
+
+    def test_vietnamese_quality(self):
+        heuristic = getattr(pdf_read, "_text_quality_suspect", None)
+        self.assertTrue(callable(heuristic))
+        healthy = "\u0110\u1ea5u th\u1ea7u Vi\u1ec7t Nam: h\u1ed3 s\u01a1, gi\u00e1 tr\u1ecb."
+        self.assertFalse(heuristic(healthy))
+        report = inspect_pdf(self.quality_source(healthy))
+        self.assertEqual((report.pages[0].state, report.pages[0].text, report.pages[0].warnings),
+                         ("TEXT_EXTRACTABLE", healthy, []))
+
+    def test_quality_threshold_and_false_negative(self):
+        heuristic = getattr(pdf_read, "_text_quality_suspect", None)
+        self.assertTrue(callable(heuristic))
+        for text, suspect in [(chr(1)*8+"x"*392, True), (chr(1)*8+"x"*393, False),
+                              (chr(1)*7, False), ("\ufffd"*8, True), ("", False),
+                              ("\t\r\n"*10, False), ("\x7f"*10, False),
+                              ("Printable nonsense", False)]:
+            with self.subTest(length=len(text)):self.assertEqual(heuristic(text), suspect)
+        # A negative heuristic result is not evidence that these strings are trustworthy.
+        text = "x"*392+chr(1)*8
+        report = inspect_pdf(self.quality_source(text), ImportLimits(max_excerpt_page_chars=20))
+        self.assertEqual((report.pages[0].state, report.pages[0].text, report.pages[0].warnings),
+                         ("UNKNOWN", "x"*20, ["EXCERPT_TRUNCATED;Q"]))
+        self.assertEqual(report.warnings, ["EXCERPT_TRUNCATED;D2;P=1;T=1;Q=1;M=0;I=0;U=1"])
+
+    def test_worker_v2_roundtrip(self):
+        source = self.quality_source("Native witness "+chr(1)*16)
+        direct = inspect_pdf(source);native = inspect_bounded(source)
+        self.assertEqual(pdf_read._report_to_wire(native), pdf_read._report_to_wire(direct))
+        self.assertEqual((native.rule_version, native.read_state), ("wp01-v2-dq", "UNKNOWN"))
+        self.assertEqual(native.pages[0].warnings, ["TEXT_QUALITY"])
+        legacy = pdf_read._report_to_wire(native)
+        legacy.update(rule_version="wp01-v1", warnings=["legacy"])
+        self.assert_rejected([pdf_read.publish_report(source, self.limits, legacy, native.sha256, True)])
+
+    def test_input_hash_and_limits(self):
+        heuristic = getattr(pdf_read, "_text_quality_suspect", None)
+        self.assertTrue(callable(heuristic))
+        source = self.quality_source("Bounded witness "+chr(1)*16)
+        before = source.read_bytes();sha = hashlib.sha256(before).hexdigest()
+        defaults = ImportLimits()
+        self.assertEqual((defaults.max_file_bytes, defaults.max_pages, defaults.max_stream_bytes,
+                          defaults.max_excerpt_page_chars, defaults.max_excerpt_file_chars),
+                         (20971520, 200, 2097152, 2000, 100000))
+        for entry in (inspect_pdf, inspect_bounded):
+            report = entry(source, ImportLimits(max_excerpt_page_chars=10))
+            self.assertEqual((report.sha256, report.pages[0].warnings), (sha, ["EXCERPT_TRUNCATED;Q"]))
+            failed = entry(source, ImportLimits(max_file_bytes=1))
+            self.assertEqual((failed.read_state, failed.pages, failed.excerpt, failed.is_valid),
+                             ("LIMIT", [], "", False))
+        self.assertEqual(source.read_bytes(), before)

@@ -164,9 +164,10 @@ def _same_wire_tree(left, right):
         return len(left) == len(right) and all(_same_wire_tree(a, b) for a, b in zip(left, right))
     return left == right
 
-def _checked_report(path, data, limits, sha256):
+def _checked_report(path, data, limits, sha256, *, historical=False):
     try:
-        checked = pdf.publish_report(path, limits, data, sha256, is_child_payload=True)
+        checked = (pdf._publish_persisted_report(path, limits, data, sha256) if historical
+                   else pdf.publish_report(path, limits, data, sha256, is_child_payload=True))
         if not _same_wire_tree(data, pdf._report_to_wire(checked)):
             raise ValueError()
         return checked
@@ -196,7 +197,7 @@ def _decode_report(path, payload, limits, sha256):
         if type(values) is not dict or values.keys() != expected:
             raise ValueError()
         values["path"] = str(path)
-        return _checked_report(path, values, limits, sha256)
+        return _checked_report(path, values, limits, sha256, historical=True)
     except StorageError:
         raise
     except Exception:
@@ -982,6 +983,14 @@ class PreparationSnapshot:
     payload: object
 
 
+@dataclass(frozen=True)
+class PreparationSummary:
+    preparation_id: str
+    created_utc: str
+    payload_version: int
+    payload_sha256: str
+
+
 def _schema_checks(sql):
     # Consume comments as tokens: commented-out constraints cannot prove admission.
     tokens = re.findall(r"--[^\n]*|/\*[\s\S]*?\*/|'(?:''|[^'])*'|\"(?:\"\"|[^\"])*\"|"
@@ -1276,3 +1285,37 @@ def open_preparation(root: Path, package_id: str, preparation_id: str) -> Prepar
         saved, value = _preparation_decode(package, _preparation_row(db, preparation_id))
         _preparation_sources(root, db, package, value, pins)
         return saved
+
+
+def list_preparations(root: Path, package_id: str) -> tuple[PreparationSummary, ...]:
+    """Read bounded saved headers for one owner; payloads remain unopened."""
+    _validate_package_id(package_id)
+    with _store(root) as (root, db), db.gate.hold():
+        if db.execute("PRAGMA user_version").fetchone()[0] != 2:
+            raise StorageError("CONFIG_ERROR", "Explicit upgrade_preparation_store is required; no auto migration")
+        package = _find_package(db, package_id)
+        rows = db.execute("""SELECT substr(preparation_id,1,37) AS preparation_id,
+            substr(created_utc,1,65) AS created_utc,
+            CASE WHEN typeof(payload_version)='integer' THEN payload_version END AS payload_version,
+            substr(payload_sha256,1,65) AS payload_sha256
+            FROM preparations WHERE package_uuid=? ORDER BY preparation_id""",
+            (package.package_uuid,)).fetchmany(MAX_ENTRIES + 1)
+        if len(rows) > MAX_ENTRIES:
+            raise StorageError("STORE_BUDGET_EXCEEDED", "Preparation inventory exceeds bounded read")
+        summaries = []
+        for row in rows:
+            try:
+                _uuid(row["preparation_id"])
+                created = row["created_utc"]
+                stamp = datetime.fromisoformat(created)
+                if (len(_utf8(created, "INTEGRITY_HOLD")) > 64 or stamp.tzinfo is None
+                        or stamp.utcoffset().total_seconds() != 0 or stamp.isoformat() != created
+                        or type(row["payload_version"]) is not int or row["payload_version"] != 1
+                        or re.fullmatch(r"[0-9a-f]{64}", row["payload_sha256"]) is None):
+                    raise ValueError()
+                summaries.append(PreparationSummary(row["preparation_id"], created,
+                    row["payload_version"], row["payload_sha256"]))
+            except (StorageError, ValueError, TypeError, UnicodeError, OverflowError):
+                raise StorageError("INTEGRITY_HOLD",
+                    "Saved preparation header is untrustworthy; preserve snapshot") from None
+        return tuple(summaries)

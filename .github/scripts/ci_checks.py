@@ -23,14 +23,14 @@ import warnings
 ROOT = Path(__file__).resolve().parents[2]
 REQUIRED_JOBS = ("scope-policy", "windows-native", "linux-portable")
 # Update only with approved test additions; IDs are independently derived/discovered.
-EXPECTED_COUNTS = {"windows-native": 151, "linux-portable": 20}
+EXPECTED_COUNTS = {"windows-native": 170, "linux-portable": 20}
 PORTABLE_CLASSES = ("TestPdfReadTypesAndDefaults", "CW02PortableContract", "CW02OracleCorrection")
 SOURCE_CAP = 80 * 1024
 OUTPUT_CAP = 256 * 1024
 WORKFLOW = ".github/workflows/ci.yml"
 PYTHON_FILES = {
     "legal_tool/__init__.py", "legal_tool/pdf_read.py", "legal_tool/storage.py", "legal_tool/worker.py",
-    "tests/__init__.py", "tests/fixture_factory.py", "tests/test_pdf_read.py", "tests/test_storage.py", "tests/test_preparations.py",
+    "tests/__init__.py", "tests/fixture_factory.py", "tests/test_pdf_read.py", "tests/test_storage.py", "tests/test_preparations.py", "tests/test_preparation_listing.py",
     ".github/scripts/ci_checks.py", ".github/scripts/test_ci_checks.py",
 }
 FIXTURES = {
@@ -188,7 +188,8 @@ def validate_entry(path, mode, raw):
     if path in FIXTURES:
         require(hashlib.sha256(raw).hexdigest() == FIXTURES[path], "synthetic fixture/oracle identity changed: " + path)
         return  # The approved 87,408-byte PDF is not Python source; do not apply its source cap.
-    cap = 32768 if path == "tests/test_preparations.py" else SOURCE_CAP
+    cap = {"tests/test_preparations.py": 32768, "tests/test_preparation_listing.py": 8192,
+           "tests/test_storage.py": 82944, "README.md": 2048}.get(path, SOURCE_CAP)
     require(len(raw) <= cap, "source/test/config exceeds approved byte cap: " + path)
     try:
         text = raw.decode("utf8")
@@ -330,7 +331,7 @@ def require_test_runtime(profile):
 
 def expected_ids(profile):
     ids = []
-    filenames = ["tests/test_pdf_read.py"] + (["tests/test_storage.py", "tests/test_preparations.py"] if profile == "windows-native" else [])
+    filenames = ["tests/test_pdf_read.py"] + (["tests/test_storage.py", "tests/test_preparations.py", "tests/test_preparation_listing.py"] if profile == "windows-native" else [])
     for filename in filenames:
         tree = ast.parse((ROOT / filename).read_bytes())
         module = filename[:-3].replace("/", ".")
