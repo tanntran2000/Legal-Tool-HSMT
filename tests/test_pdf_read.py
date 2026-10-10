@@ -1504,4 +1504,3 @@ class ReaderDiagnosticTests(_ContractCase):
             self.assertEqual((failed.read_state, failed.pages, failed.excerpt, failed.is_valid),
                              ("LIMIT", [], "", False))
         self.assertEqual(source.read_bytes(), before)
-
