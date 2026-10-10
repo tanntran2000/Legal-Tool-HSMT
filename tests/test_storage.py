@@ -185,9 +185,18 @@ class TestStoragePortablePolicy(unittest.TestCase):
         p["pages"]=[dict(page_index=i,state="TEXT_EXTRACTABLE",text="\x01"*1000,locator="page-"+str(i+1),warnings=[]) for i in range(100)]
         p.update(page_count=100,excerpt=frozen.pdf_read.derive_excerpt([frozen.PageReading(**x) for x in p["pages"]],100000))
         raw=_payload(p);self.assertGreater(len(raw.encode()),1024*1024)
-        r=s._decode_report(path,raw,LIMITS(),"a"*64)
+        before=raw.encode();r=s._decode_report(path,raw,LIMITS(),"a"*64)
+        self.assertTrue(s._same_wire_tree(frozen.pdf_read._report_to_wire(r),p))
+        self.assertEqual(raw.encode(),before)
+        with self.assertRaises(s.StorageError) as refused:s._encode_report(path,r,LIMITS(),"a"*64)
+        self.assertEqual(refused.exception.code,"REPORT_CONTRACT_REJECTED")
+        current=deepcopy(p);current.update(rule_version="wp01-v2-dq",read_state="UNKNOWN",warnings=["D2;P=100;T=0;Q=100;M=0;I=0;U=100"])
+        for page in current["pages"]:page.update(state="UNKNOWN",warnings=["TEXT_QUALITY"])
+        fresh=_payload(current);self.assertGreater(len(fresh.encode()),1024*1024)
+        r=s._decode_report(path,fresh,LIMITS(),"a"*64)
         saved=s._encode_report(path,r,LIMITS(),"a"*64)
-        self.assertTrue(s._same_wire_tree(frozen.pdf_read._report_to_wire(s._decode_report(path,saved,LIMITS(),"a"*64)),p))
+        self.assertTrue(s._same_wire_tree(frozen.pdf_read._report_to_wire(s._decode_report(path,saved,LIMITS(),"a"*64)),current))
+        self.assertEqual(raw.encode(),before)
         with self.assertRaises(s.StorageError):s._decode_report(path," "*(2*1024*1024+1),LIMITS(),"a"*64)
 
 class _NativeCase(unittest.TestCase):
@@ -204,6 +213,11 @@ class _NativeCase(unittest.TestCase):
             if process.poll() is None:process.terminate()
             process.communicate(timeout=3)
             self.assertIsNotNone(process.returncode)
+            for pipe in (process.stdin,process.stdout,process.stderr):
+                if pipe:self.assertTrue(pipe.closed)
+            if os.name=="nt":
+                if not process._handle.closed:process._handle.Close()
+                self.assertTrue(process._handle.closed)
 
     def seed(self,s,ids=("A",)):
         for package_id in ids:s.create_package(self.store,package_id,package_id)

@@ -164,9 +164,10 @@ def _same_wire_tree(left, right):
         return len(left) == len(right) and all(_same_wire_tree(a, b) for a, b in zip(left, right))
     return left == right
 
-def _checked_report(path, data, limits, sha256):
+def _checked_report(path, data, limits, sha256, *, historical=False):
     try:
-        checked = pdf.publish_report(path, limits, data, sha256, is_child_payload=True)
+        checked = (pdf._publish_persisted_report(path, limits, data, sha256) if historical
+                   else pdf.publish_report(path, limits, data, sha256, is_child_payload=True))
         if not _same_wire_tree(data, pdf._report_to_wire(checked)):
             raise ValueError()
         return checked
@@ -196,7 +197,7 @@ def _decode_report(path, payload, limits, sha256):
         if type(values) is not dict or values.keys() != expected:
             raise ValueError()
         values["path"] = str(path)
-        return _checked_report(path, values, limits, sha256)
+        return _checked_report(path, values, limits, sha256, historical=True)
     except StorageError:
         raise
     except Exception:

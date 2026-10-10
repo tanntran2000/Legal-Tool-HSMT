@@ -165,6 +165,13 @@ class TestCIGates(unittest.TestCase):
 
     def test_source_size_and_syntax(self):
         ci.validate_entry("legal_tool/storage.py", "100644", b"x = 1\n")
+        ci.validate_entry("tests/test_storage.py", "100644", b"#" + b"x" * (82944 - 1))
+        with self.assertRaises(ValueError):
+            ci.validate_entry("tests/test_storage.py", "100644", b"#" + b"x" * 82944)
+        for path, cap in [("tests/test_preparation_listing.py", 8192), ("README.md", 2048)]:
+            ci.validate_entry(path, "100644", b"#" + b"x" * (cap - 1))
+            with self.assertRaises(ValueError):
+                ci.validate_entry(path, "100644", b"#" + b"x" * cap)
         for raw in [b"#" + b"x" * 81920, b"invalid python ???", b"\xff"]:
             with self.subTest(length=len(raw)), self.assertRaises(ValueError):
                 ci.validate_entry("legal_tool/storage.py", "100644", raw)
@@ -269,7 +276,15 @@ class TestCIGates(unittest.TestCase):
         portable = ci.expected_ids("linux-portable")
         self.assertTrue(required <= set(windows))
         self.assertFalse(required & set(portable))
-        self.assertEqual(len(windows), 119 + len(required))
+        self.assertEqual(len(windows), 138 + len(required))
+        listing = {x for x in windows if x.startswith("tests.test_preparation_listing.")}
+        reader = {x for x in windows if ".ReaderDiagnosticTests." in x}
+        self.assertEqual(len(listing), 7)
+        self.assertEqual(len(reader), 12)
+        self.assertFalse((listing | reader) & set(portable))
+        for missing in (listing, reader):
+            with self.assertRaises(ValueError):
+                ci.validate_inventory(windows, [x for x in windows if x not in missing], [])
         self.assertEqual(len(portable), 20)
         with self.assertRaises(ValueError):
             ci.validate_inventory(windows, [x for x in windows if x not in required], [])

@@ -261,7 +261,7 @@ class ReadReport:
     read_state: str = "UNKNOWN"  # TEXT_EXTRACTABLE, IMAGE_ONLY, MIXED, LOCKED, CORRUPT, UNSUPPORTED, LIMIT, UNKNOWN
     pages: List[PageReading] = field(default_factory=list)
     parser_version: str = "pypdf/6.10.0"
-    rule_version: str = "wp01-v1"
+    rule_version: str = "wp01-v2-dq"
     sha256: str = ""
     warnings: List[str] = field(default_factory=list)
     is_valid: bool = False
@@ -269,7 +269,7 @@ class ReadReport:
 
 
 PARSER_VERSION = "pypdf/6.10.0"
-RULE_VERSION = "wp01-v1"
+RULE_VERSION = "wp01-v2-dq"
 ALLOWED_PAGE_STATES = {"TEXT_EXTRACTABLE", "IMAGE_ONLY", "MIXED", "UNKNOWN"}
 ALLOWED_COMPLETED_DOC_STATES = {"TEXT_EXTRACTABLE", "IMAGE_ONLY", "MIXED", "UNKNOWN"}
 ALLOWED_FAILURE_DOC_STATES = {"LOCKED", "CORRUPT", "UNSUPPORTED", "LIMIT"}
@@ -417,6 +417,8 @@ _PAGE_FIELD_TYPES = {
 def _require_report_fields(data: dict, schema: dict, location: str) -> None:
     if type(data) is not dict:
         raise _ReportContractError(location + " must be an object")
+    if data.keys() != schema.keys():
+        raise _ReportContractError(location + " unexpected or missing fields")
     for name, expected_type in schema.items():
         if name not in data or type(data[name]) is not expected_type:
             raise _ReportContractError(location + " missing or invalid " + name)
@@ -436,6 +438,7 @@ def _missing_hash_code(warnings: List[str]) -> str:
 
 def _validate_report(
     admitted_path: Path, limits: ImportLimits, data: dict, captured_sha256: str,
+    *, historical: bool = False,
 ) -> ReadReport:
     """One predicate for DTO adaptations and received wire fields; no repairs."""
     _require_report_fields(data, _REPORT_FIELD_TYPES, "report")
@@ -443,7 +446,8 @@ def _validate_report(
     data["excerpt"].encode("utf-8")
     if not _path_is_utf8(data["path"]) or not _path_is_utf8(admitted_path):
         raise _ReportContractError("report path must encode as UTF-8")
-    if data["parser_version"] != PARSER_VERSION or data["rule_version"] != RULE_VERSION:
+    versions = ("wp01-v1", RULE_VERSION) if historical else (RULE_VERSION,)
+    if data["parser_version"] != PARSER_VERSION or data["rule_version"] not in versions:
         raise _ReportContractError("unexpected parser or rule version")
     try:
         identity_matches = os.path.normcase(os.path.abspath(data["path"])) == os.path.normcase(
@@ -507,12 +511,54 @@ def _validate_report(
     )
 
 
-def publish_report(
+_PAGE_DIAGNOSTICS = {
+    "EXCERPT_TRUNCATED": (1, 0),
+    "TEXT_QUALITY": (0, 1),
+    "EXCERPT_TRUNCATED;Q": (1, 1),
+}
+_RESERVED_DIAGNOSTICS = ("EXCERPT_TRUNCATED", "TEXT_QUALITY", "D2")
+
+
+def _page_diagnostic_flags(page: PageReading) -> tuple[int, int]:
+    flags = (0, 0)
+    for index, warning in enumerate(page.warnings):
+        if warning.startswith(_RESERVED_DIAGNOSTICS):
+            if index != 0 or warning not in _PAGE_DIAGNOSTICS:
+                raise _ReportContractError("invalid reserved page diagnostic")
+            flags = _PAGE_DIAGNOSTICS[warning]
+    if flags[1] and page.state not in {"MIXED", "UNKNOWN"}:
+        raise _ReportContractError("quality diagnostic contradicts page state")
+    return flags
+
+
+def _diagnostic_summary(pages: List[PageReading]) -> str:
+    """Count retained states and tokens without dropping unknown facts."""
+    flags = [_page_diagnostic_flags(page) for page in pages]
+    truncated = sum(flag[0] for flag in flags)
+    quality = sum(flag[1] for flag in flags)
+    states = [page.state for page in pages]
+    summary = (f"D2;P={len(pages)};T={truncated};Q={quality};"
+               f"M={states.count('MIXED')};I={states.count('IMAGE_ONLY')};U={states.count('UNKNOWN')}")
+    return ("EXCERPT_TRUNCATED;" if truncated else "") + summary
+
+
+def _validate_v2_diagnostics(report: ReadReport) -> None:
+    """Require canonical counts/tokens only after raw warning-byte admission."""
+    if not report.is_valid:
+        return
+    if not report.warnings or report.warnings[0] != _diagnostic_summary(report.pages):
+        raise _ReportContractError("document diagnostic summary contradicts retained pages")
+    if any(warning.startswith(_RESERVED_DIAGNOSTICS) for warning in report.warnings[1:]):
+        raise _ReportContractError("invalid reserved document diagnostic")
+
+
+def _publish_report(
     admitted_path: Path,
     limits: ImportLimits,
     raw_report: ReadReport | dict,
     captured_sha256: str = "",
     is_child_payload: bool = False,
+    *, historical: bool = False,
 ) -> ReadReport:
     """Publish only reports accepted by the common shape/identity/state predicate.
 
@@ -523,8 +569,10 @@ def publish_report(
     received = is_child_payload or type(raw_report) is dict
     try:
         data = _report_to_wire(raw_report) if type(raw_report) is ReadReport else raw_report
-        report = _validate_report(admitted_path, limits, data, captured_sha256)
+        report = _validate_report(admitted_path, limits, data, captured_sha256, historical=historical)
         warning_bytes = calculate_aggregate_warning_bytes(report.warnings, report.pages)
+        if warning_bytes <= 4096 and report.rule_version == RULE_VERSION:
+            _validate_v2_diagnostics(report)
     except _ReportContractError as exc:
         reason = str(exc)
     except UnicodeError:
@@ -545,6 +593,21 @@ def publish_report(
             )
         reason = "aggregate warning bytes exceed 4096 budget"
     return _build_failure_report(admitted_path, "LIMIT", ["CHILD_PROCESS_ERROR: " + reason])
+
+
+def publish_report(
+    admitted_path: Path, limits: ImportLimits, raw_report: ReadReport | dict,
+    captured_sha256: str = "", is_child_payload: bool = False,
+) -> ReadReport:
+    """Fresh producers and received worker output require the current rule."""
+    return _publish_report(admitted_path, limits, raw_report, captured_sha256, is_child_payload)
+
+
+def _publish_persisted_report(
+    path: Path, limits: ImportLimits, data: dict, captured_sha256: str,
+) -> ReadReport:
+    """Explicit stored-report context; legacy facts are readable, never upgraded."""
+    return _publish_report(path, limits, data, captured_sha256, True, historical=True)
 
 
 def _get_page_count_bounded(reader: PdfReader, max_pages: int) -> Tuple[int, bool]:
@@ -780,6 +843,12 @@ def _get_page_stream_size_bounded(page, max_stream_bytes: int) -> int:
     return total_decoded
 
 
+def _text_quality_suspect(text: str) -> bool:
+    """Conservative diagnostic only; a negative result does not establish quality."""
+    bad = sum((ord(c) < 32 and ord(c) not in (9, 10, 13)) or ord(c) == 65533 for c in text)
+    return bad >= 8 and bad * 50 >= len(text)
+
+
 def inspect_pdf(path: Path | str, limits: Optional[ImportLimits] = None) -> ReadReport:
     """Inspect a PDF document within approved resource limits using real pypdf 6.10.0."""
     str_path = str(path)
@@ -918,7 +987,6 @@ def inspect_pdf(path: Path | str, limits: Optional[ImportLimits] = None) -> Read
 
     # Inspect individual pages with stream limit and shared excerpt budget
     pages: List[PageReading] = []
-    overall_warnings: List[str] = []
     remaining_file_excerpt_budget = actual_limits.max_excerpt_file_chars
 
     for idx, p in enumerate(reader.pages):
@@ -944,36 +1012,42 @@ def inspect_pdf(path: Path | str, limits: Optional[ImportLimits] = None) -> Read
                 sha256=sha256,
             )
 
+        text_known = images_known = True
         try:
             raw_text = p.extract_text() or ""
         except Exception:
             raw_text = ""
+            text_known = False
 
         try:
             num_images = len(p.images)
         except Exception:
             num_images = 0
+            images_known = False
 
         has_text = len(raw_text.strip()) > 0
         has_images = num_images > 0
+        quality_suspect = _text_quality_suspect(raw_text)
 
-        if has_text and has_images:
+        if not (text_known and images_known):
+            state = "UNKNOWN"
+        elif (has_text or quality_suspect) and has_images:
             state = "MIXED"
-            page_warnings.append("MIXED_CONTENT: page contains both text and bitmap elements")
-        elif has_text:
+        elif has_text and not quality_suspect:
             state = "TEXT_EXTRACTABLE"
         elif has_images:
             state = "IMAGE_ONLY"
-            page_warnings.append("IMAGE_ONLY_NO_TEXT: page contains bitmap without extractable text layer")
         else:
             state = "UNKNOWN"
-            page_warnings.append("UNKNOWN_COVERAGE: page contains vector/blank elements without extractable text or bitmap")
+
+        if quality_suspect:
+            page_warnings.append("TEXT_QUALITY")
 
         # Enforce shared excerpt budget across pages and file
         allowed_chars = min(actual_limits.max_excerpt_page_chars, remaining_file_excerpt_budget)
         page_text = raw_text[:allowed_chars]
         if len(raw_text) > actual_limits.max_excerpt_page_chars or len(raw_text) > remaining_file_excerpt_budget:
-            page_warnings.append(f"EXCERPT_TRUNCATED: text truncated to {allowed_chars} characters")
+            page_warnings[:] = ["EXCERPT_TRUNCATED;Q" if quality_suspect else "EXCERPT_TRUNCATED"]
 
         remaining_file_excerpt_budget = max(0, remaining_file_excerpt_budget - len(page_text))
 
@@ -984,7 +1058,6 @@ def inspect_pdf(path: Path | str, limits: Optional[ImportLimits] = None) -> Read
             locator=f"page-{idx+1}",
             warnings=page_warnings,
         ))
-        overall_warnings.extend(page_warnings)
 
     raw_report = ReadReport(
         path=resolved_path,
@@ -994,7 +1067,7 @@ def inspect_pdf(path: Path | str, limits: Optional[ImportLimits] = None) -> Read
         parser_version=PARSER_VERSION,
         rule_version=RULE_VERSION,
         sha256=sha256,
-        warnings=overall_warnings,
+        warnings=[_diagnostic_summary(pages)],
         is_valid=True,
         excerpt=derive_excerpt(pages, actual_limits.max_excerpt_file_chars),
     )

@@ -470,6 +470,8 @@ def _child_main():
     limits = ImportLimits(**limits_dict)
 
     report = inspect_pdf(args.path, limits)
+    # Child and parent publication use only the fresh rule context.
+    report = publish_report(Path(args.path), limits, report, captured_sha256=report.sha256)
 
     report_dict = _report_to_wire(report)
 
