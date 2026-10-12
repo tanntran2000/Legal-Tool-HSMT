@@ -23,17 +23,33 @@ import warnings
 ROOT = Path(__file__).resolve().parents[2]
 REQUIRED_JOBS = ("scope-policy", "windows-native", "linux-portable")
 # Update only with approved test additions; IDs are independently derived/discovered.
-EXPECTED_COUNTS = {"windows-native": 170, "linux-portable": 20}
+LEGACY_COUNTS = {"windows-native": 170, "linux-portable": 20}
+EXPECTED_COUNTS = {"windows-native": 180, "linux-portable": 26}
 PORTABLE_CLASSES = ("TestPdfReadTypesAndDefaults", "CW02PortableContract", "CW02OracleCorrection")
+DISPLAY_TEST = 'tools/standalone_display/tests/test_display.py'
+DISPLAY_CLASSES = {'DisplayPortableContract': (
+    'test_fictional_model_inventory', 'test_pin_rejects_changed_short_and_oversized_bytes',
+    'test_contract_rejects_false_assessment_and_wrong_inventory',
+    'test_source_composition_preserves_complete_fictional_blocks',
+    'test_no_gui_dependency_on_import_and_model_paths', 'test_cli_rejects_arguments_without_opening_ui'),
+    'DisplayNativeUI': ('test_primary_parameters_all_goods_both_sizes',
+    'test_secondary_source_readonly_and_selection_resets',
+    'test_keyboard_goods_copy_and_button_activation', 'test_checklist_expansion_and_readonly_source')}
+HANDOFF_CAPS = {'tools/standalone_display/display.py': 24576,
+    'tools/standalone_display/display_data.json': 32768, DISPLAY_TEST: 20480,
+    'tools/standalone_display/README.md': 4096,
+    '.github/scripts/ci_checks.py': 80 * 1024, '.github/scripts/test_ci_checks.py': 80 * 1024}
 SOURCE_CAP = 80 * 1024
 OUTPUT_CAP = 256 * 1024
 WORKFLOW = ".github/workflows/ci.yml"
 PYTHON_FILES = {
+    "tools/standalone_display/display.py", DISPLAY_TEST,
     "legal_tool/__init__.py", "legal_tool/pdf_read.py", "legal_tool/storage.py", "legal_tool/worker.py",
     "tests/__init__.py", "tests/fixture_factory.py", "tests/test_pdf_read.py", "tests/test_storage.py", "tests/test_preparations.py", "tests/test_preparation_listing.py",
     ".github/scripts/ci_checks.py", ".github/scripts/test_ci_checks.py",
 }
 FIXTURES = {
+    "tools/standalone_display/display_data.json": "9f69eae322ac4066fa95284a7855c7570fa01976be6dd7940f13ec486f876406",
     "tests/fixtures/corrupt.pdf": "b3da49d3483747ad476e2f461dfbbb72516203e2e0947ddefed90f50d8deb5d6",
     "tests/fixtures/expected.json": "5f12210bcd4934f0af26da4d763e9f104112ad96cc761c1d10391b6569d300ba",
     "tests/fixtures/image_only.pdf": "3553a18e977e37d5ae313d12f4141d2bda836942090d0be0146e4311c7389b19",
@@ -44,7 +60,7 @@ FIXTURES = {
     "tests/fixtures/text_unicode.pdf": "f8fab60581b6954744122fb34a2f3e371f607030c985b856baa865160e7465fd",
     "tests/fixtures/unsupported.txt": "d1e0d082cd811c10affadcf9bad2d5b00c1748a09fd9284f0076cc20e2233bdc",
 }
-ALLOWED_FILES = PYTHON_FILES | set(FIXTURES) | {WORKFLOW, "README.md", ".gitignore", "requirements-wp01.txt"}
+ALLOWED_FILES = PYTHON_FILES | set(FIXTURES) | {WORKFLOW, "README.md", ".gitignore", "requirements-wp01.txt", "tools/standalone_display/README.md"}
 ACTIONS = {
     "actions/checkout": "3d3c42e5aac5ba805825da76410c181273ba90b1",  # v7.0.1
     "actions/setup-python": "5fda3b95a4ea91299a34e894583c3862153e4b97",  # v7.0.0
@@ -185,6 +201,9 @@ def validate_entry(path, mode, raw):
             and not PurePosixPath(path).is_absolute() and ".." not in PurePosixPath(path).parts,
             "path outside approved source/CI/synthetic-fixture policy: " + str(path))
     require(mode == "100644", "unsupported file type/mode: " + path)
+    require(type(raw) is bytes, "file bytes required: " + path)
+    if path in HANDOFF_CAPS:
+        require(len(raw) <= HANDOFF_CAPS[path], "standalone handoff exceeds approved byte cap: " + path)
     if path in FIXTURES:
         require(hashlib.sha256(raw).hexdigest() == FIXTURES[path], "synthetic fixture/oracle identity changed: " + path)
         return  # The approved 87,408-byte PDF is not Python source; do not apply its source cap.
@@ -201,6 +220,14 @@ def validate_entry(path, mode, raw):
             validate_workflow(decode_json(raw))
     except (UnicodeError, SyntaxError) as error:
         raise ValueError("UTF8/syntax error in " + path + ": " + str(error)) from error
+
+
+def validate_handoff(entries):
+    require(set(HANDOFF_CAPS) <= set(entries), 'missing six-file standalone handoff member')
+    for path, cap in HANDOFF_CAPS.items():
+        size = entries[path]['bytes']
+        require(type(size) is int and 0 < size <= cap, 'handoff individual byte cap: ' + path)
+    require(sum(entries[p]['bytes'] for p in HANDOFF_CAPS) <= 100000, 'handoff full-file aggregate byte cap')
 
 
 def validate_workflow(workflow):
@@ -341,6 +368,15 @@ def expected_ids(profile):
                     continue
                 ids.extend(module + "." + node.name + "." + method.name for method in node.body
                            if isinstance(method, ast.FunctionDef) and method.name.startswith("test_"))
+    require(len(ids) == LEGACY_COUNTS[profile], "approved legacy test count changed")
+    tree = ast.parse((ROOT / DISPLAY_TEST).read_bytes())
+    classes = [n for n in tree.body if isinstance(n, ast.ClassDef)]
+    require({n.name for n in classes} == set(DISPLAY_CLASSES), 'standalone test class inventory changed')
+    for node in classes:
+        methods = tuple(m.name for m in node.body if isinstance(m, ast.FunctionDef) and m.name.startswith('test_'))
+        require(methods == DISPLAY_CLASSES[node.name], 'standalone test method inventory changed')
+        if profile == 'windows-native' or node.name == 'DisplayPortableContract':
+            ids.extend(DISPLAY_TEST[:-3].replace('/', '.') + '.' + node.name + '.' + m for m in methods)
     require(len(ids) == EXPECTED_COUNTS[profile], "approved expected test count changed; review EXPECTED_COUNTS update")
     return ids
 
@@ -350,6 +386,8 @@ def collect_suite(profile):
     loader = unittest.TestLoader()
     suite = (loader.discover(str(ROOT / "tests"), top_level_dir=str(ROOT)) if profile == "windows-native"
              else loader.loadTestsFromNames(["tests.test_pdf_read." + name for name in PORTABLE_CLASSES]))
+    classes = list(DISPLAY_CLASSES) if profile == 'windows-native' else ['DisplayPortableContract']
+    suite.addTests(loader.loadTestsFromNames([DISPLAY_TEST[:-3].replace('/', '.') + '.' + c for c in classes]))
     def flatten(value):
         for case in value:
             if isinstance(case, unittest.TestSuite):
@@ -378,7 +416,8 @@ def scope():
         require(git("cat-file", "blob", oid) == raw, "working bytes differ from staged blob: " + path)
         entries[path] = dict(bytes=len(raw), sha256=hashlib.sha256(raw).hexdigest(), git_blob=oid)
     require(set(entries) == ALLOWED_FILES, "missing/extra policy-controlled file")
-    return {"entries": entries, "source_cap_bytes": SOURCE_CAP, "fixture_policy": "nine pinned synthetic members; separate from source cap"}
+    validate_handoff(entries)
+    return {"entries": entries, "source_cap_bytes": SOURCE_CAP, "fixture_policy": "ten pinned synthetic members; standalone fixture capped at32768B", "handoff_bytes": sum(entries[p]['bytes'] for p in HANDOFF_CAPS)}
 
 
 class BoundedLog:
