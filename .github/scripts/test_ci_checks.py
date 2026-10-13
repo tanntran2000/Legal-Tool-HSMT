@@ -36,6 +36,65 @@ class SyntheticCase(unittest.TestCase):
 
 
 class TestCIGates(unittest.TestCase):
+    def test_standalone_exact_members_and_caps(self):
+        prefix = 'tools/standalone_display/'
+        for name, cap in [('display.py', 24576), ('tests/test_display.py', 20480), ('README.md', 4096)]:
+            path = prefix + name
+            self.assertIn(path, ci.ALLOWED_FILES)
+            ci.validate_entry(path, '100644', b'#' + b'x' * (cap - 1))
+            with self.assertRaises(ValueError):
+                ci.validate_entry(path, '100644', b'#' + b'x' * cap)
+        for path in [prefix + 'extra.py', prefix + 'tests/extra.py', prefix + 'other.json']:
+            with self.assertRaises(ValueError):
+                ci.validate_entry(path, '100644', b'{}')
+
+    def test_standalone_fixture_cap_precedes_pin(self):
+        import hashlib
+        path = 'tools/standalone_display/display_data.json'
+        self.assertIn(path, ci.FIXTURES)
+        raw = (ROOT / path).read_bytes()
+        ci.validate_entry(path, '100644', raw)
+        for mode in ['120000', '160000', '100755', None]:
+            with self.assertRaises(ValueError):
+                ci.validate_entry(path, mode, raw)
+        with self.assertRaises(ValueError):
+            ci.validate_entry(path, '100644', raw.replace(b'DEMO', b'TEST', 1))
+        oversized = b'x' * 32769
+        with patch.dict(ci.FIXTURES, {path: hashlib.sha256(oversized).hexdigest()}):
+            with self.assertRaisesRegex(ValueError, 'cap'):
+                ci.validate_entry(path, '100644', oversized)
+
+    def test_standalone_inventory_and_legacy_subsets(self):
+        module = 'tools.standalone_display.tests.test_display.'
+        windows = ci.expected_ids('windows-native')
+        portable = ci.expected_ids('linux-portable')
+        for profile, ids, old in [('windows-native', windows, 170), ('linux-portable', portable, 20)]:
+            additions = [x for x in ids if x.startswith(module)]
+            self.assertTrue(additions)
+            self.assertEqual(len(ids) - len(additions), old)
+            self.assertTrue(any('.DisplayPortableContract.' in x for x in additions))
+            self.assertEqual(any('.DisplayNativeUI.' in x for x in additions), profile == 'windows-native')
+            for absent in [additions, additions[:1]]:
+                with self.assertRaises(ValueError):
+                    ci.validate_inventory(ids, [x for x in ids if x not in absent], [])
+
+    def test_standalone_aggregate_full_file_cap(self):
+        self.assertTrue(hasattr(ci, 'HANDOFF_CAPS'), 'six-file full-byte policy missing')
+        self.assertEqual(set(ci.HANDOFF_CAPS), {'tools/standalone_display/' + p for p in
+            ['display.py', 'display_data.json', 'tests/test_display.py', 'README.md']} |
+            {'.github/scripts/ci_checks.py', '.github/scripts/test_ci_checks.py'})
+        entries = {p: {'bytes': 1} for p in ci.HANDOFF_CAPS}
+        ci.validate_handoff(entries)
+        entries['.github/scripts/ci_checks.py']['bytes'] = 100000
+        with self.assertRaisesRegex(ValueError, 'cap'):
+            ci.validate_handoff(entries)
+        entries = {p: {'bytes': cap} for p, cap in ci.HANDOFF_CAPS.items()}
+        with self.assertRaisesRegex(ValueError, 'aggregate'):
+            ci.validate_handoff(entries)
+        entries.pop('tools/standalone_display/README.md')
+        with self.assertRaisesRegex(ValueError, 'missing'):
+            ci.validate_handoff(entries)
+
     def setUp(self):
         self.assertIsNotNone(ci, "CI helper does not exist yet")
         self.ids = ["tests.synthetic.Case.test_one"]
@@ -156,7 +215,7 @@ class TestCIGates(unittest.TestCase):
             report = ci.read_json(path / "tests.json")
             self.assertNotEqual(exit_code, 0)
             self.assertEqual(report["status"], "FAILED")
-            self.assertEqual(report["tests_run"], 20)
+            self.assertEqual(report["tests_run"], ci.EXPECTED_COUNTS['linux-portable'])
             self.assertEqual(len(report["resource_warnings"]), 1)
             self.assertIn("during discovery", report["resource_warnings"][0])
             self.assertIn("ResourceWarning", (path / "tests.log").read_text(encoding="utf8"))
@@ -274,6 +333,8 @@ class TestCIGates(unittest.TestCase):
         self.assertTrue(required)
         windows = ci.expected_ids("windows-native")
         portable = ci.expected_ids("linux-portable")
+        windows = [x for x in windows if not x.startswith('tools.standalone_display.')]
+        portable = [x for x in portable if not x.startswith('tools.standalone_display.')]
         self.assertTrue(required <= set(windows))
         self.assertFalse(required & set(portable))
         self.assertEqual(len(windows), 138 + len(required))
