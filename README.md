@@ -1,19 +1,33 @@
 # Legal-Tool-HSMT
-Tool Pháp lý nội bộ
 
-## Phạm vi hỗ trợ V1
+Công cụ đang phát triển cho nhân sự pháp lý/đấu thầu QI, hướng tới hỗ trợ chuẩn bị và rà soát hồ sơ mời thầu (HSMT).
 
-Mỗi kho dữ liệu chỉ dùng trong một phiên Windows. Hỗ trợ nhiều tiến trình do ứng dụng quản lý và phối hợp với nhau trong cùng phiên.
+## Hiện có
 
-Truy cập đồng thời cùng kho từ phiên Windows hoặc tài khoản khác không được hỗ trợ trong V1. Kiểm thử giữa các phiên: **NOT_TESTED**.
+- Lõi Python đọc văn bản PDF có giới hạn, lưu bản gốc theo gói hồ sơ và kiểm tra tính toàn vẹn.
+- API lưu, mở và liệt kê bản chụp chuẩn bị rà soát; chưa phải kết luận pháp lý.
+- Demo giao diện riêng: xem các tab HSMT, Chương V, Mục 3; chọn hàng hóa, xem thông số và nguồn minh họa. Toàn bộ dữ liệu là giả.
 
-Cơ chế phối hợp Global hiện có giữ nguyên. Đây là giới hạn hỗ trợ, không phải cơ chế mới ngăn truy cập ngoài phạm vi hoặc bằng chứng hoạt động giữa các phiên.
+## Chạy thử demo
 
-## Saved preparation test-store API
-Creation stays at schema 1. Explicit `upgrade_preparation_store(root)` upgrades an admitted, quiescent existing store to schema 2 atomically and idempotently. Old binaries refuse schema 2. Ordinary open never migrates; no live upgrade is authorized here.
+Cần Python và Tk. Mở terminal tại thư mục mã nguồn đã tải, chạy:
 
-`save_preparation(root, package_id, preparation_id, payload)` appends an immutable snapshot; `open_preparation(root, package_id, preparation_id)` verifies saved checksum and managed sources without reparsing external files. Same UUID/content retries return stored time/checksum; conflicting reuse rejects.
+```sh
+python -X utf8 -B tools/standalone_display/display.py
+```
 
-Payload v1 has exactly `payload_version`, `checklist_row`, `doc_refs`, `source_spans`. One row has `name/status/next_action/submission_summary`; status remains a recorded decision, not legal approval. Up to 8 DocRefs bind `package_id/package_uuid/file_id/file_version/sha256/byte_count/managed_relative_path` in this store, including a separate QI package. Spans use `doc_ref/page/locator/start/end/text`: ref index, 1-based page, exact persisted text offsets. Canonical UTF-8 JSON is at most64KiB. Active imports, relevant owner HOLD, uncertain integrity and projected database/journal budget block writes. Tests use synthetic fixtures; real-source parser/UI acceptance is pending.
+Demo chỉ đọc dữ liệu mẫu kèm theo; không đọc PDF thật, kết nối lõi hay lưu chỉnh sửa. [Hướng dẫn và phím tắt](tools/standalone_display/README.md).
 
-Source/test cap: 100000 bytes. Oversize: none. Track path, bytes, reason and review status. Block until approved; never auto-delete.
+## Đang phát triển
+
+Trích yêu cầu từ HSMT/Chương V thật và đối chiếu với kho hồ sơ QI đang phát triển. Bộ trích xuất và giao diện cho hồ sơ thật còn chờ nghiệm thu. Nhân sự phụ trách vẫn cần rà soát.
+
+## Giới hạn V1
+
+Mỗi kho chỉ hỗ trợ một phiên Windows, với các tiến trình do ứng dụng phối hợp. Truy cập đồng thời cùng kho từ phiên/tài khoản khác không được hỗ trợ; kiểm thử liên phiên: **NOT_TESTED**. Không tự động chuyển đổi kho; không nâng cấp khi kho đang hoạt động.
+
+## Dành cho người đóng góp
+
+Mã nguồn/test: tối đa 100000 byte mỗi tệp. Tệp quá cỡ: chưa có. Ghi đường dẫn, số byte, lý do, trạng thái duyệt; chặn đến khi được duyệt, không tự xóa.
+
+[Tham chiếu API và phạm vi V1 tại bản 22cb30a (cố định)](https://github.com/tanntran2000/Legal-Tool-HSMT/blob/22cb30a464bb915a78852a669faa2ca43a4173f8/README.md).
