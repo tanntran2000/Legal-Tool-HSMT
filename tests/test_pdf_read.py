@@ -9,7 +9,6 @@ from ctypes import wintypes
 import hashlib
 import io
 import json
-import math
 import os
 from pathlib import Path
 import shutil
@@ -1245,9 +1244,6 @@ if os.name != "nt":
         _class.__unittest_skip_why__ = "Native Windows contract requires real APIs"
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 class ReaderDiagnosticTests(_ContractCase):
     """Approved v2 diagnostics; synthetic data contains no legal oracle."""
 
@@ -1454,6 +1450,7 @@ class ReaderDiagnosticTests(_ContractCase):
         self.assertEqual((report.excerpt, report.sha256), (text, hashlib.sha256(before).hexdigest()))
         self.assertEqual(source.read_bytes(), before)
 
+
     def test_vietnamese_quality(self):
         heuristic = getattr(pdf_read, "_text_quality_suspect", None)
         self.assertTrue(callable(heuristic))
@@ -1504,3 +1501,8 @@ class ReaderDiagnosticTests(_ContractCase):
             self.assertEqual((failed.read_state, failed.pages, failed.excerpt, failed.is_valid),
                              ("LIMIT", [], "", False))
         self.assertEqual(source.read_bytes(), before)
+
+
+if __name__ == "__main__":
+    unittest.main(defaultTest=None if os.name == "nt" else (
+        "TestPdfReadTypesAndDefaults", "CW02PortableContract", "CW02OracleCorrection"))

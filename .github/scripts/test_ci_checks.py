@@ -6,6 +6,7 @@ import io
 import json
 import os
 from pathlib import Path
+import runpy
 import subprocess
 import sys
 import tempfile
@@ -38,7 +39,7 @@ class SyntheticCase(unittest.TestCase):
 class TestCIGates(unittest.TestCase):
     def test_standalone_exact_members_and_caps(self):
         prefix = 'tools/standalone_display/'
-        for name, cap in [('display.py', 24576), ('tests/test_display.py', 20480), ('README.md', 4096)]:
+        for name, cap in [('display.py', 100000), ('tests/test_display.py', 100000), ('README.md', 4096)]:
             path = prefix + name
             self.assertIn(path, ci.ALLOWED_FILES)
             ci.validate_entry(path, '100644', b'#' + b'x' * (cap - 1))
@@ -78,22 +79,55 @@ class TestCIGates(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     ci.validate_inventory(ids, [x for x in ids if x not in absent], [])
 
-    def test_standalone_aggregate_full_file_cap(self):
+    def test_standalone_members_without_retired_bundle_cap(self):
         self.assertTrue(hasattr(ci, 'HANDOFF_CAPS'), 'six-file full-byte policy missing')
         self.assertEqual(set(ci.HANDOFF_CAPS), {'tools/standalone_display/' + p for p in
             ['display.py', 'display_data.json', 'tests/test_display.py', 'README.md']} |
             {'.github/scripts/ci_checks.py', '.github/scripts/test_ci_checks.py'})
         entries = {p: {'bytes': 1} for p in ci.HANDOFF_CAPS}
         ci.validate_handoff(entries)
-        entries['.github/scripts/ci_checks.py']['bytes'] = 100000
+        entries['.github/scripts/ci_checks.py']['bytes'] = 100001
         with self.assertRaisesRegex(ValueError, 'cap'):
             ci.validate_handoff(entries)
         entries = {p: {'bytes': cap} for p, cap in ci.HANDOFF_CAPS.items()}
-        with self.assertRaisesRegex(ValueError, 'aggregate'):
-            ci.validate_handoff(entries)
+        self.assertGreater(sum(row['bytes'] for row in entries.values()), 100000)
+        ci.validate_handoff(entries)  # PR4's completed publication bundle is historical.
         entries.pop('tools/standalone_display/README.md')
         with self.assertRaisesRegex(ValueError, 'missing'):
             ci.validate_handoff(entries)
+
+    def test_source_test_decimal_100000_byte_boundaries(self):
+        self.assertEqual(ci.SOURCE_CAP, 100000)
+        for path in sorted(ci.PYTHON_FILES):
+            with self.subTest(path=path):
+                try:
+                    ci.validate_entry(path, '100644', b'#' + b'x' * 99999)
+                except ValueError as error:
+                    self.fail('100000-byte source/test must be admitted: ' + str(error))
+                with self.assertRaisesRegex(ValueError, 'cap'):
+                    ci.validate_entry(path, '100644', b'#' + b'x' * 100000)
+
+    def test_direct_pdf_runner_collects_platform_inventory(self):
+        collected = []
+        def flatten(suite):
+            for item in suite:
+                if isinstance(item, unittest.TestSuite):
+                    yield from flatten(item)
+                else:
+                    yield item.id().replace('__main__.', 'tests.test_pdf_read.', 1)
+        def collect_only(program):
+            collected.extend(flatten(program.test))
+        sys.path.insert(0, str(ROOT))
+        try:
+            with patch.object(unittest.TestProgram, 'runTests', collect_only), \
+                 patch.object(sys, 'argv', [str(ROOT / 'tests/test_pdf_read.py')]):
+                runpy.run_path(str(ROOT / 'tests/test_pdf_read.py'), run_name='__main__')
+        finally:
+            sys.path.pop(0)
+        profile = 'windows-native' if os.name == 'nt' else 'linux-portable'
+        expected = [identity for identity in ci.expected_ids(profile)
+                    if identity.startswith('tests.test_pdf_read.')]
+        self.assertEqual(sorted(collected), sorted(expected))
 
     def setUp(self):
         self.assertIsNotNone(ci, "CI helper does not exist yet")
@@ -224,14 +258,14 @@ class TestCIGates(unittest.TestCase):
 
     def test_source_size_and_syntax(self):
         ci.validate_entry("legal_tool/storage.py", "100644", b"x = 1\n")
-        ci.validate_entry("tests/test_storage.py", "100644", b"#" + b"x" * (82944 - 1))
+        ci.validate_entry("tests/test_storage.py", "100644", b"#" + b"x" * 99999)
         with self.assertRaises(ValueError):
-            ci.validate_entry("tests/test_storage.py", "100644", b"#" + b"x" * 82944)
-        for path, cap in [("tests/test_preparation_listing.py", 8192), ("README.md", 2048)]:
+            ci.validate_entry("tests/test_storage.py", "100644", b"#" + b"x" * 100000)
+        for path, cap in [("tests/test_preparation_listing.py", 100000), ("README.md", 2048)]:
             ci.validate_entry(path, "100644", b"#" + b"x" * (cap - 1))
             with self.assertRaises(ValueError):
                 ci.validate_entry(path, "100644", b"#" + b"x" * cap)
-        for raw in [b"#" + b"x" * 81920, b"invalid python ???", b"\xff"]:
+        for raw in [b"#" + b"x" * 100000, b"invalid python ???", b"\xff"]:
             with self.subTest(length=len(raw)), self.assertRaises(ValueError):
                 ci.validate_entry("legal_tool/storage.py", "100644", raw)
 
@@ -251,8 +285,9 @@ class TestCIGates(unittest.TestCase):
             with self.subTest(raw=raw), self.assertRaises(ValueError):
                 ci.validate_entry("requirements-wp01.txt", "100644", raw)
 
-    def test_fixture_larger_than_source_cap(self):
+    def test_fixture_pin_independent_of_source_cap(self):
         path = "tests/fixtures/page_limit.pdf"; raw = (ROOT / path).read_bytes()
+        # This fixture exceeded the historical80KiB source cap; its pin is independent.
         self.assertGreater(len(raw), 81920)
         ci.validate_entry(path, "100644", raw)
         with self.assertRaises(ValueError):
@@ -316,12 +351,12 @@ class TestCIGates(unittest.TestCase):
                 self.assertNotIn("PASS", result.stdout)
 
 
-    def test_preparation_module_has_approved_32k_cap(self):
+    def test_preparation_module_has_approved_source_cap(self):
         self.assertIn("tests/test_preparations.py", ci.ALLOWED_FILES)
         ci.validate_entry("tests/test_preparations.py", "100644", b"x = 1\n")
-        ci.validate_entry("tests/test_preparations.py", "100644", b"#" + b"x" * (32768 - 1))
+        ci.validate_entry("tests/test_preparations.py", "100644", b"#" + b"x" * 99999)
         with self.assertRaises(ValueError):
-            ci.validate_entry("tests/test_preparations.py", "100644", b"#" + b"x" * 32768)
+            ci.validate_entry("tests/test_preparations.py", "100644", b"#" + b"x" * 100000)
 
     def test_preparation_ids_are_required_only_in_windows_inventory(self):
         import ast

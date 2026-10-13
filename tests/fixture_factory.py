@@ -15,7 +15,6 @@ Generates exactly nine preregistered fixtures:
 import argparse
 import io
 import json
-import sys
 from pathlib import Path
 
 from PIL import Image

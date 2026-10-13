@@ -1,7 +1,6 @@
 """Fictional display contracts. Portable methods never require Tk."""
 from copy import deepcopy
 import importlib.util
-import json
 from pathlib import Path
 import subprocess
 import sys
