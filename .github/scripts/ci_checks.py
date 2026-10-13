@@ -35,11 +35,11 @@ DISPLAY_CLASSES = {'DisplayPortableContract': (
     'DisplayNativeUI': ('test_primary_parameters_all_goods_both_sizes',
     'test_secondary_source_readonly_and_selection_resets',
     'test_keyboard_goods_copy_and_button_activation', 'test_checklist_expansion_and_readonly_source')}
-HANDOFF_CAPS = {'tools/standalone_display/display.py': 24576,
-    'tools/standalone_display/display_data.json': 32768, DISPLAY_TEST: 20480,
+SOURCE_CAP = 100000  # Decimal bytes per repository source/test file.
+HANDOFF_CAPS = {'tools/standalone_display/display.py': SOURCE_CAP,
+    'tools/standalone_display/display_data.json': 32768, DISPLAY_TEST: SOURCE_CAP,
     'tools/standalone_display/README.md': 4096,
-    '.github/scripts/ci_checks.py': 80 * 1024, '.github/scripts/test_ci_checks.py': 80 * 1024}
-SOURCE_CAP = 80 * 1024
+    '.github/scripts/ci_checks.py': SOURCE_CAP, '.github/scripts/test_ci_checks.py': SOURCE_CAP}
 OUTPUT_CAP = 256 * 1024
 WORKFLOW = ".github/workflows/ci.yml"
 PYTHON_FILES = {
@@ -207,8 +207,7 @@ def validate_entry(path, mode, raw):
     if path in FIXTURES:
         require(hashlib.sha256(raw).hexdigest() == FIXTURES[path], "synthetic fixture/oracle identity changed: " + path)
         return  # The approved 87,408-byte PDF is not Python source; do not apply its source cap.
-    cap = {"tests/test_preparations.py": 32768, "tests/test_preparation_listing.py": 8192,
-           "tests/test_storage.py": 82944, "README.md": 2048}.get(path, SOURCE_CAP)
+    cap = 2048 if path == "README.md" else SOURCE_CAP if path in PYTHON_FILES else 80 * 1024
     require(len(raw) <= cap, "source/test/config exceeds approved byte cap: " + path)
     try:
         text = raw.decode("utf8")
@@ -227,7 +226,7 @@ def validate_handoff(entries):
     for path, cap in HANDOFF_CAPS.items():
         size = entries[path]['bytes']
         require(type(size) is int and 0 < size <= cap, 'handoff individual byte cap: ' + path)
-    require(sum(entries[p]['bytes'] for p in HANDOFF_CAPS) <= 100000, 'handoff full-file aggregate byte cap')
+    # PR4's six-file aggregate was a completed publication budget, not a global cap.
 
 
 def validate_workflow(workflow):

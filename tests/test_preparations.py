@@ -1,5 +1,4 @@
 """Synthetic WP-V1 persistence regressions; no real hospital or legal acceptance."""
-from contextlib import ExitStack
 from copy import deepcopy
 import ctypes
 from dataclasses import FrozenInstanceError
