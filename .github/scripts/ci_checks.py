@@ -24,8 +24,18 @@ ROOT = Path(__file__).resolve().parents[2]
 REQUIRED_JOBS = ("scope-policy", "windows-native", "linux-portable")
 # Update only with approved test additions; IDs are independently derived/discovered.
 LEGACY_COUNTS = {"windows-native": 170, "linux-portable": 20}
-EXPECTED_COUNTS = {"windows-native": 180, "linux-portable": 26}
+EXPECTED_COUNTS = {"windows-native": 188, "linux-portable": 34}
 PORTABLE_CLASSES = ("TestPdfReadTypesAndDefaults", "CW02PortableContract", "CW02OracleCorrection")
+ERROR_LOG_CLASS = "TestErrorLogFormatter"
+ERROR_LOG_METHODS = (
+    'test_error_log_known_codes_ids_and_determinism',
+    'test_error_log_excludes_source_paths_messages_and_secrets',
+    'test_error_log_invalid_required_metadata_and_unknown_versions',
+    'test_error_log_warning_scan_budget_and_utf8_output_boundaries',
+    'test_error_log_page_states_quality_truncation_and_d2_summary',
+    'test_error_log_token_boundaries_and_unclassified_counts',
+    'test_error_log_no_side_effects_or_input_mutation',
+    'test_error_log_exact_normal_and_fallback_text')
 DISPLAY_TEST = 'tools/standalone_display/tests/test_display.py'
 DISPLAY_CLASSES = {'DisplayPortableContract': (
     'test_fictional_model_inventory', 'test_pin_rejects_changed_short_and_oversized_bytes',
@@ -363,11 +373,22 @@ def expected_ids(profile):
         module = filename[:-3].replace("/", ".")
         for node in tree.body:
             if isinstance(node, ast.ClassDef) and not node.name.startswith("_"):
+                if filename == "tests/test_pdf_read.py" and node.name == ERROR_LOG_CLASS:
+                    continue
                 if profile == "linux-portable" and node.name not in PORTABLE_CLASSES:
                     continue
                 ids.extend(module + "." + node.name + "." + method.name for method in node.body
                            if isinstance(method, ast.FunctionDef) and method.name.startswith("test_"))
     require(len(ids) == LEGACY_COUNTS[profile], "approved legacy test count changed")
+    pdf_tree = ast.parse((ROOT / "tests/test_pdf_read.py").read_bytes())
+    formatter = [n for n in pdf_tree.body if isinstance(n, ast.ClassDef) and n.name == ERROR_LOG_CLASS]
+    require(len(formatter) == 1, "error log test class inventory changed")
+    methods = [n for n in formatter[0].body
+               if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name.startswith('test_')]
+    require(tuple(n.name for n in methods) == ERROR_LOG_METHODS
+            and all(isinstance(n, ast.FunctionDef) for n in methods),
+            "error log test method inventory changed")
+    ids.extend("tests.test_pdf_read." + ERROR_LOG_CLASS + "." + name for name in ERROR_LOG_METHODS)
     tree = ast.parse((ROOT / DISPLAY_TEST).read_bytes())
     classes = [n for n in tree.body if isinstance(n, ast.ClassDef)]
     require({n.name for n in classes} == set(DISPLAY_CLASSES), 'standalone test class inventory changed')
@@ -385,6 +406,8 @@ def collect_suite(profile):
     loader = unittest.TestLoader()
     suite = (loader.discover(str(ROOT / "tests"), top_level_dir=str(ROOT)) if profile == "windows-native"
              else loader.loadTestsFromNames(["tests.test_pdf_read." + name for name in PORTABLE_CLASSES]))
+    if profile == "linux-portable":
+        suite.addTests(loader.loadTestsFromName("tests.test_pdf_read." + ERROR_LOG_CLASS))
     classes = list(DISPLAY_CLASSES) if profile == 'windows-native' else ['DisplayPortableContract']
     suite.addTests(loader.loadTestsFromNames([DISPLAY_TEST[:-3].replace('/', '.') + '.' + c for c in classes]))
     def flatten(value):
