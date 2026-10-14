@@ -1503,6 +1503,210 @@ class ReaderDiagnosticTests(_ContractCase):
         self.assertEqual(source.read_bytes(), before)
 
 
+class TestErrorLogFormatter(unittest.TestCase):
+    INVALID = (
+        "LEGAL_TOOL_DIAGNOSTIC_TEXT 1\nissue_ids=LT-LOG-INVALID_METADATA\n"
+        "diagnostic_scan_complete=false\n"
+        "next_action=Metadata chẩn đoán không hợp lệ; giữ nguyên bằng chứng và báo hỗ trợ.\n")
+    OUTPUT_LIMIT = (
+        "LEGAL_TOOL_DIAGNOSTIC_TEXT 1\nissue_ids=LT-LOG-OUTPUT_LIMIT\n"
+        "diagnostic_scan_complete=false\n"
+        "next_action=Log vượt ngân sách 4096 bytes UTF-8; chi tiết không được xuất. "
+        "Báo hỗ trợ mã LT-LOG-OUTPUT_LIMIT.\n")
+
+    def report(self, **changes):
+        value = ReadReport(Path("synthetic-unused.pdf"), page_count=1,
+            read_state="TEXT_EXTRACTABLE", pages=[PageReading(0, "TEXT_EXTRACTABLE")],
+            is_valid=True)
+        for name, replacement in changes.items():
+            setattr(value, name, replacement)
+        return value
+
+    def values(self, report):
+        text = pdf_read.format_error_log(report)
+        self.assertTrue(text.endswith("\n"))
+        self.assertNotIn("\r", text)
+        self.assertLessEqual(len(text.encode("utf-8")), 4096)
+        return dict(line.split("=", 1) for line in text.splitlines()[1:])
+
+    def test_error_log_known_codes_ids_and_determinism(self):
+        codes = ("CONFIG_ERROR", "UNC_PATH_REFUSED", "DEVICE_PATH_REFUSED",
+            "PATH_NOT_FOUND", "NOT_A_REGULAR_FILE", "PATH_ADMISSION_FAILED",
+            "REPARSE_POINT_REFUSED", "OPEN_FAILED", "READ_ERROR",
+            "FILE_SIZE_LIMIT_EXCEEDED", "UNSUPPORTED_FORMAT", "LIMIT_GUARD_UNAVAILABLE",
+            "TIMEOUT_LIMIT_EXCEEDED", "CHILD_PROCESS_ERROR", "WORKER_EXECUTION_ERROR")
+        for code in codes:
+            with self.subTest(code=code):
+                report = self.report(read_state="LIMIT", warnings=[code, code + ": private suffix"])
+                text = pdf_read.format_error_log(report)
+                self.assertEqual(text, pdf_read.format_error_log(report))
+                self.assertEqual(self.values(report)["issue_ids"],
+                                 "LT-DIAG-" + code + ",LT-STATE-LIMIT")
+        for state in sorted(pdf_read.ALLOWED_DOC_STATES):
+            fields = self.values(self.report(read_state=state))
+            self.assertEqual(fields["issue_ids"], "NONE" if state == "TEXT_EXTRACTABLE"
+                             else "LT-STATE-" + state)
+        report = self.report(warnings=list(reversed(codes)))
+        self.assertEqual(self.values(report)["issue_ids"],
+                         ",".join(sorted("LT-DIAG-" + code for code in codes)))
+
+    def test_error_log_excludes_source_paths_messages_and_secrets(self):
+        class Poison:
+            def __str__(self):
+                raise AssertionError("excluded field coerced")
+            __repr__ = __str__
+        report = self.report(warnings=["READ_ERROR: C:\\private\\secret.pdf TOKEN=canary\x00\r\nế",
+                                     "UNRECOGNIZED canary\x00\nế"])
+        expected = pdf_read.format_error_log(report)
+        for field in ("path", "sha256", "excerpt"):
+            setattr(report, field, Poison())
+        for field in ("page_index", "text", "locator"):
+            setattr(report.pages[0], field, Poison())
+        self.assertEqual(pdf_read.format_error_log(report), expected)
+        for canary in ("private", "secret.pdf", "TOKEN", "canary", "UNRECOGNIZED", "\x00"):
+            self.assertNotIn(canary, expected)
+        report.warnings = ["READ_ERROR:" + "ế" * 100000]
+        self.assertEqual(self.values(report)["issue_ids"], "LT-DIAG-READ_ERROR")
+
+    def test_error_log_invalid_required_metadata_and_unknown_versions(self):
+        class OtherReport(ReadReport):
+            pass
+        class OtherPage(PageReading):
+            pass
+        class OtherString(str):
+            pass
+        for value in (None, {}, object(), OtherReport(Path("unused"))):
+            self.assertEqual(pdf_read.format_error_log(value), self.INVALID)
+        bad = {"page_count": [-1, 201, True, 1.5, "1"],
+               "read_state": [None, [], "BAD", OtherString("TEXT_EXTRACTABLE")],
+               "pages": [None, (), {}, [PageReading(0, "UNKNOWN")] * 201],
+               "warnings": [None, (), {}, [None]], "is_valid": [None, 1, "true"]}
+        for field, values in bad.items():
+            for value in values:
+                with self.subTest(field=field, bad_type=type(value).__name__):
+                    self.assertEqual(pdf_read.format_error_log(self.report(**{field: value})), self.INVALID)
+            report = self.report()
+            del report.__dict__[field]
+            self.assertEqual(pdf_read.format_error_log(report), self.INVALID)
+        for page in (None, object(), OtherPage(0, "UNKNOWN"), PageReading(0, []),
+                     PageReading(0, "BAD"), PageReading(0, "UNKNOWN", warnings=()),
+                     PageReading(0, "UNKNOWN", warnings=[1])):
+            self.assertEqual(pdf_read.format_error_log(self.report(pages=[page])), self.INVALID)
+        for field in ("state", "warnings"):
+            page = PageReading(0, "UNKNOWN")
+            del page.__dict__[field]
+            self.assertEqual(pdf_read.format_error_log(self.report(pages=[page])), self.INVALID)
+        for version in (None, object(), "SECRET", OtherString(pdf_read.PARSER_VERSION)):
+            fields = self.values(self.report(parser_version=version, rule_version=version))
+            self.assertEqual((fields["parser_version"], fields["rule_version"]), ("UNKNOWN", "UNKNOWN"))
+            self.assertEqual(fields["issue_ids"], "LT-LOG-INVALID_METADATA")
+            self.assertEqual(fields["retained_pages"], "1")
+        report = self.report()
+        del report.__dict__["parser_version"]
+        self.assertEqual(self.values(report)["parser_version"], "UNKNOWN")
+
+    def test_error_log_warning_scan_budget_and_utf8_output_boundaries(self):
+        report = self.report(warnings=["READ_ERROR"] * 16 + [object(), "ignored"],
+            pages=[PageReading(0, "UNKNOWN", warnings=["TEXT_QUALITY"] * 16 + [object()])])
+        fields = self.values(report)
+        self.assertEqual((fields["report_warnings_scanned"], fields["report_warnings_unscanned"],
+                          fields["page_warnings_scanned"], fields["page_warnings_unscanned"]),
+                         ("16", "2", "16", "1"))
+        self.assertEqual(fields["diagnostic_scan_complete"], "false")
+        self.assertIn("LT-LOG-SCAN_LIMIT", fields["issue_ids"])
+        self.assertEqual(fields["text_quality_pages"], "1")
+        report = self.report(page_count=200, warnings=["READ_ERROR"] * 16,
+            pages=[PageReading(i, "UNKNOWN", warnings=["TEXT_QUALITY"] * 16) for i in range(200)])
+        fields = self.values(report)
+        self.assertEqual((fields["page_warnings_scanned"], fields["retained_pages"]), ("3200", "200"))
+        self.assertEqual(fields["diagnostic_scan_complete"], "true")
+        for text in ("x" * 4096, "ế" * 1365):
+            self.assertEqual(pdf_read._bound_error_log_text(text), text)
+        for text in ("x" * 4097, "ế" * 1366, "\ud800"):
+            self.assertEqual(pdf_read._bound_error_log_text(text), self.OUTPUT_LIMIT)
+
+    def test_error_log_page_states_quality_truncation_and_d2_summary(self):
+        pages = [PageReading(0, "TEXT_EXTRACTABLE", warnings=["EXCERPT_TRUNCATED"] * 2),
+                 PageReading(1, "IMAGE_ONLY"),
+                 PageReading(2, "MIXED", warnings=["TEXT_QUALITY"] * 2),
+                 PageReading(3, "UNKNOWN", warnings=["EXCERPT_TRUNCATED;Q"] * 2)]
+        for prefix in ("", "EXCERPT_TRUNCATED;"):
+            report = self.report(page_count=4, read_state="MIXED", pages=pages,
+                warnings=[prefix + "D2;P=200;T=200;Q=200;M=200;I=200;U=200"])
+            fields = self.values(report)
+            self.assertEqual(fields["page_states"], "IMAGE_ONLY:1,MIXED:1,TEXT_EXTRACTABLE:1,UNKNOWN:1")
+            self.assertEqual((fields["excerpt_truncated_pages"], fields["text_quality_pages"]), ("2", "2"))
+            self.assertEqual(fields["unrecognized_report_warnings_scanned"], "0")
+            self.assertEqual(fields["issue_ids"],
+                "LT-PAGE-EXCERPT_TRUNCATED,LT-PAGE-TEXT_QUALITY,LT-STATE-MIXED")
+        fields = self.values(self.report(read_state="IMAGE_ONLY", page_count=0,
+            pages=[PageReading(0, "IMAGE_ONLY")], warnings=["D2;P=1;T=0;Q=0;M=0;I=1;U=0"]))
+        self.assertEqual((fields["page_count_reported"], fields["retained_pages"]), ("0", "1"))
+        self.assertEqual(fields["issue_ids"], "LT-STATE-IMAGE_ONLY")
+        self.assertNotIn("goods", fields)
+
+    def test_error_log_token_boundaries_and_unclassified_counts(self):
+        for token in ("READ_ERRORX", "prefixREAD_ERROR", "READ_ERROR : suffix",
+                      "D2;P=01;T=0;Q=0;M=0;I=0;U=0", "D2;P=201;T=0;Q=0;M=0;I=0;U=0",
+                      "D2;P=١;T=0;Q=0;M=0;I=0;U=0", "D2;P=1;T=0;Q=0;M=0;I=0;U=0\n",
+                      "D2;T=0;P=1;Q=0;M=0;I=0;U=0", "D2;P=-1;T=0;Q=0;M=0;I=0;U=0",
+                      "D2;P=1;T=0;Q=0;M=0;I=0;U=0;extra", "D2;" + "P" * 81):
+            fields = self.values(self.report(warnings=[token]))
+            self.assertEqual(fields["unrecognized_report_warnings_scanned"], "1")
+            self.assertEqual(fields["issue_ids"], "LT-LOG-UNCLASSIFIED_DIAGNOSTIC")
+        page = PageReading(0, "UNKNOWN", warnings=["Q", "TEXT_QUALITY:secret", "xEXCERPT_TRUNCATED"])
+        fields = self.values(self.report(pages=[page]))
+        self.assertEqual(fields["unrecognized_page_warnings_scanned"], "3")
+        self.assertEqual((fields["excerpt_truncated_pages"], fields["text_quality_pages"]), ("0", "0"))
+        fields = self.values(self.report(read_state="LIMIT", warnings=["READ_ERROR:", "READ_ERROR:unknown"]))
+        self.assertEqual(fields["issue_ids"], "LT-DIAG-READ_ERROR,LT-STATE-LIMIT")
+        self.assertEqual(fields["unrecognized_report_warnings_scanned"], "0")
+
+    def test_error_log_no_side_effects_or_input_mutation(self):
+        import socket
+        import tkinter
+        import urllib.request
+        report = self.report(warnings=["READ_ERROR:private"],
+            pages=[PageReading(0, "UNKNOWN", text="untouched", warnings=["TEXT_QUALITY"])])
+        before = deepcopy(report)
+        with ExitStack() as stack:
+            for owner, name in ((Path, "read_bytes"), (subprocess, "Popen"),
+                                (socket, "socket"), (urllib.request, "urlopen"),
+                                (pdf_read, "inspect_pdf"), (pdf_read, "_read_file_snapshot"),
+                                (os, "getenv"), (tkinter.Misc, "clipboard_append"),
+                                (tkinter.Misc, "clipboard_get")):
+                stack.enter_context(patch.object(owner, name, side_effect=AssertionError("side effect")))
+            stack.enter_context(patch("builtins.open", side_effect=AssertionError("file I/O")))
+            first = pdf_read.format_error_log(report)
+            self.assertEqual(pdf_read.format_error_log(report), first)
+        self.assertEqual(report, before)
+        self.assertEqual(_NATIVE_CALLS, [])
+
+    def test_error_log_exact_normal_and_fallback_text(self):
+        expected = (
+            "LEGAL_TOOL_DIAGNOSTIC_TEXT 1\nissue_ids=NONE\nread_state=TEXT_EXTRACTABLE\n"
+            "report_is_valid=true\nparser_version=pypdf/6.10.0\nrule_version=wp01-v2-dq\n"
+            "page_count_reported=1\nretained_pages=1\n"
+            "page_states=IMAGE_ONLY:0,MIXED:0,TEXT_EXTRACTABLE:1,UNKNOWN:0\n"
+            "report_warnings_scanned=0\nreport_warnings_unscanned=0\n"
+            "page_warnings_scanned=0\npage_warnings_unscanned=0\n"
+            "unrecognized_report_warnings_scanned=0\nunrecognized_page_warnings_scanned=0\n"
+            "excerpt_truncated_pages=0\ntext_quality_pages=0\ndiagnostic_scan_complete=true\n"
+            "source_content_and_free_messages=OMITTED\n"
+            "next_action=Báo mã loại lỗi cho hỗ trợ; giữ nguyên bằng chứng và không tự thay guard. "
+            "Log không kết luận độ phủ nguồn hoặc điều kiện pháp lý.\n")
+        self.assertEqual(pdf_read.format_error_log(self.report()), expected)
+        self.assertEqual(pdf_read.format_error_log(self.report(is_valid=False)),
+                         expected.replace("report_is_valid=true", "report_is_valid=false"))
+        self.assertEqual(pdf_read.format_error_log(None), self.INVALID)
+        self.assertEqual(pdf_read._bound_error_log_text("x" * 4097), self.OUTPUT_LIMIT)
+        for text in (expected, self.INVALID, self.OUTPUT_LIMIT):
+            self.assertTrue(text.endswith("\n"))
+            self.assertFalse(text.endswith("\n\n"))
+            self.assertLessEqual(len(text.encode("utf8")), 4096)
+
+
 if __name__ == "__main__":
     unittest.main(defaultTest=None if os.name == "nt" else (
-        "TestPdfReadTypesAndDefaults", "CW02PortableContract", "CW02OracleCorrection"))
+        "TestPdfReadTypesAndDefaults", "CW02PortableContract", "CW02OracleCorrection",
+        "TestErrorLogFormatter"))

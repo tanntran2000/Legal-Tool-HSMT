@@ -37,6 +37,47 @@ class SyntheticCase(unittest.TestCase):
 
 
 class TestCIGates(unittest.TestCase):
+    def test_error_log_exact_portable_ids_and_legacy_subsets(self):
+        methods = ('test_error_log_known_codes_ids_and_determinism',
+            'test_error_log_excludes_source_paths_messages_and_secrets',
+            'test_error_log_invalid_required_metadata_and_unknown_versions',
+            'test_error_log_warning_scan_budget_and_utf8_output_boundaries',
+            'test_error_log_page_states_quality_truncation_and_d2_summary',
+            'test_error_log_token_boundaries_and_unclassified_counts',
+            'test_error_log_no_side_effects_or_input_mutation',
+            'test_error_log_exact_normal_and_fallback_text')
+        prefix = 'tests.test_pdf_read.TestErrorLogFormatter.'
+        for profile, count, old in [('windows-native', 188, 170), ('linux-portable', 34, 20)]:
+            ids = ci.expected_ids(profile)
+            self.assertEqual([x for x in ids if x.startswith(prefix)], [prefix+m for m in methods])
+            self.assertEqual(len(ids), count)
+            self.assertEqual(len([x for x in ids if not x.startswith(prefix)
+                and not x.startswith('tools.standalone_display.')]), old)
+            for actual in ([x for x in ids if not x.startswith(prefix)], ids+[prefix+methods[0]]):
+                with self.assertRaises(ValueError):
+                    ci.validate_inventory(ids, actual, [])
+        self.assertEqual(ci.PORTABLE_CLASSES,
+            ('TestPdfReadTypesAndDefaults', 'CW02PortableContract', 'CW02OracleCorrection'))
+
+    def test_error_log_inventory_rejects_missing_duplicate_or_nonportable_methods(self):
+        self.assertTrue(hasattr(ci, 'ERROR_LOG_METHODS'), 'formatter inventory missing')
+        target = ROOT / 'tests/test_pdf_read.py'
+        original = target.read_bytes()
+        name = b'test_error_log_exact_normal_and_fallback_text'
+        variants = [original.replace(b'class TestErrorLogFormatter', b'class OtherFormatter', 1),
+                    original.replace(b'def '+name, b'def omitted_formatter_case', 1),
+                    original.replace(b'def '+name, b'async def '+name, 1),
+                    original.replace(b'def '+name, b'def test_nonportable_native_case', 1),
+                    original.replace(b'    def '+name, b'    def '+name+b'(self):\n        pass\n\n    def '+name, 1)]
+        read_bytes = Path.read_bytes
+        for raw in variants:
+            def read(path):
+                return raw if path == target else read_bytes(path)
+            with patch.object(Path, 'read_bytes', read):
+                for profile in ('windows-native', 'linux-portable'):
+                    with self.subTest(profile=profile), self.assertRaises(ValueError):
+                        ci.expected_ids(profile)
+
     def test_standalone_exact_members_and_caps(self):
         prefix = 'tools/standalone_display/'
         for name, cap in [('display.py', 100000), ('tests/test_display.py', 100000), ('README.md', 4096)]:
@@ -71,8 +112,10 @@ class TestCIGates(unittest.TestCase):
         portable = ci.expected_ids('linux-portable')
         for profile, ids, old in [('windows-native', windows, 170), ('linux-portable', portable, 20)]:
             additions = [x for x in ids if x.startswith(module)]
+            formatter = [x for x in ids if x.startswith('tests.test_pdf_read.TestErrorLogFormatter.')]
             self.assertTrue(additions)
-            self.assertEqual(len(ids) - len(additions), old)
+            self.assertEqual(len(formatter), 8)
+            self.assertEqual(len(ids) - len(additions) - len(formatter), old)
             self.assertTrue(any('.DisplayPortableContract.' in x for x in additions))
             self.assertEqual(any('.DisplayNativeUI.' in x for x in additions), profile == 'windows-native')
             for absent in [additions, additions[:1]]:
@@ -370,6 +413,8 @@ class TestCIGates(unittest.TestCase):
         portable = ci.expected_ids("linux-portable")
         windows = [x for x in windows if not x.startswith('tools.standalone_display.')]
         portable = [x for x in portable if not x.startswith('tools.standalone_display.')]
+        windows = [x for x in windows if not x.startswith('tests.test_pdf_read.TestErrorLogFormatter.')]
+        portable = [x for x in portable if not x.startswith('tests.test_pdf_read.TestErrorLogFormatter.')]
         self.assertTrue(required <= set(windows))
         self.assertFalse(required & set(portable))
         self.assertEqual(len(windows), 138 + len(required))

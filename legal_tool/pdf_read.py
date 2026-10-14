@@ -294,6 +294,140 @@ ALLOWED_MISSING_HASH_PREFIXES = (
 )
 
 
+_ERROR_LOG_INVALID = (
+    "LEGAL_TOOL_DIAGNOSTIC_TEXT 1\nissue_ids=LT-LOG-INVALID_METADATA\n"
+    "diagnostic_scan_complete=false\n"
+    "next_action=Metadata chẩn đoán không hợp lệ; giữ nguyên bằng chứng và báo hỗ trợ.\n")
+_ERROR_LOG_OUTPUT_LIMIT = (
+    "LEGAL_TOOL_DIAGNOSTIC_TEXT 1\nissue_ids=LT-LOG-OUTPUT_LIMIT\n"
+    "diagnostic_scan_complete=false\n"
+    "next_action=Log vượt ngân sách 4096 bytes UTF-8; chi tiết không được xuất. "
+    "Báo hỗ trợ mã LT-LOG-OUTPUT_LIMIT.\n")
+
+
+def _bound_error_log_text(text: str) -> str:
+    """Finalize sanitized text without truncation or encoding repair."""
+    try:
+        return text if len(text.encode("utf-8")) <= 4096 else _ERROR_LOG_OUTPUT_LIMIT
+    except UnicodeError:
+        return _ERROR_LOG_OUTPUT_LIMIT
+
+
+def _error_log_d2_summary(text: str) -> bool:
+    """Recognize bounded producer metadata; its counters are never used."""
+    if len(text) > 80 or not text.isascii():
+        return False
+    if text.startswith("EXCERPT_TRUNCATED;"):
+        text = text[len("EXCERPT_TRUNCATED;"):]
+    parts = text.split(";")
+    if len(parts) != 7 or parts[0] != "D2":
+        return False
+    for key, part in zip(("P", "T", "Q", "M", "I", "U"), parts[1:]):
+        if not part.startswith(key + "="):
+            return False
+        number = part[2:]
+        if (not number.isdecimal() or len(number) > 3
+                or (len(number) > 1 and number.startswith("0")) or int(number) > 200):
+            return False
+    return True
+
+
+def format_error_log(report: ReadReport) -> str:
+    """Render bounded allowlisted metadata, without reading source/free messages."""
+    if type(report) is not ReadReport:
+        return _ERROR_LOG_INVALID
+    data = report.__dict__
+    required = ("page_count", "read_state", "pages", "warnings", "is_valid")
+    if not all(key in data for key in required):
+        return _ERROR_LOG_INVALID
+    count, state, pages, warnings, valid = (data[key] for key in required)
+    if (type(count) is not int or not 0 <= count <= 200
+            or type(state) is not str or state not in ALLOWED_DOC_STATES
+            or type(pages) is not list or len(pages) > 200
+            or type(warnings) is not list or type(valid) is not bool):
+        return _ERROR_LOG_INVALID
+    ids = set()
+    versions = []
+    for key, approved in (("parser_version", PARSER_VERSION), ("rule_version", RULE_VERSION)):
+        value = data.get(key)
+        if type(value) is str and value == approved:
+            versions.append(approved)
+        else:
+            versions.append("UNKNOWN")
+            ids.add("LT-LOG-INVALID_METADATA")
+    states = dict.fromkeys(("IMAGE_ONLY", "MIXED", "TEXT_EXTRACTABLE", "UNKNOWN"), 0)
+    page_scanned = page_unscanned = page_unknown = truncated = quality = 0
+    for page in pages:
+        if type(page) is not PageReading:
+            return _ERROR_LOG_INVALID
+        fields = page.__dict__
+        if "state" not in fields or "warnings" not in fields:
+            return _ERROR_LOG_INVALID
+        page_state, page_warnings = fields["state"], fields["warnings"]
+        if (type(page_state) is not str or page_state not in ALLOWED_PAGE_STATES
+                or type(page_warnings) is not list):
+            return _ERROR_LOG_INVALID
+        states[page_state] += 1
+        scanned = min(16, len(page_warnings))
+        page_scanned += scanned
+        page_unscanned += len(page_warnings) - scanned
+        has_truncation = has_quality = False
+        for index in range(scanned):
+            token = page_warnings[index]
+            if type(token) is not str:
+                return _ERROR_LOG_INVALID
+            if token == "EXCERPT_TRUNCATED":
+                has_truncation = True
+            elif token == "TEXT_QUALITY":
+                has_quality = True
+            elif token == "EXCERPT_TRUNCATED;Q":
+                has_truncation = has_quality = True
+            else:
+                page_unknown += 1
+        truncated += has_truncation
+        quality += has_quality
+    report_scanned = min(16, len(warnings))
+    report_unscanned = len(warnings) - report_scanned
+    report_unknown = 0
+    for index in range(report_scanned):
+        token = warnings[index]
+        if type(token) is not str:
+            return _ERROR_LOG_INVALID
+        for code in ALLOWED_MISSING_HASH_PREFIXES:
+            if token == code or token.startswith(code + ":"):
+                ids.add("LT-DIAG-" + code)
+                break
+        else:
+            if not _error_log_d2_summary(token):
+                report_unknown += 1
+    if state != "TEXT_EXTRACTABLE":
+        ids.add("LT-STATE-" + state)
+    if truncated:
+        ids.add("LT-PAGE-EXCERPT_TRUNCATED")
+    if quality:
+        ids.add("LT-PAGE-TEXT_QUALITY")
+    if report_unknown or page_unknown:
+        ids.add("LT-LOG-UNCLASSIFIED_DIAGNOSTIC")
+    if report_unscanned or page_unscanned:
+        ids.add("LT-LOG-SCAN_LIMIT")
+    lines = (
+        "LEGAL_TOOL_DIAGNOSTIC_TEXT 1", "issue_ids=" + (",".join(sorted(ids)) or "NONE"),
+        "read_state=" + state, "report_is_valid=" + ("true" if valid else "false"),
+        "parser_version=" + versions[0], "rule_version=" + versions[1],
+        f"page_count_reported={count}", f"retained_pages={len(pages)}",
+        "page_states=" + ",".join(f"{key}:{value}" for key, value in states.items()),
+        f"report_warnings_scanned={report_scanned}", f"report_warnings_unscanned={report_unscanned}",
+        f"page_warnings_scanned={page_scanned}", f"page_warnings_unscanned={page_unscanned}",
+        f"unrecognized_report_warnings_scanned={report_unknown}",
+        f"unrecognized_page_warnings_scanned={page_unknown}",
+        f"excerpt_truncated_pages={truncated}", f"text_quality_pages={quality}",
+        "diagnostic_scan_complete=" + ("false" if report_unscanned or page_unscanned else "true"),
+        "source_content_and_free_messages=OMITTED",
+        "next_action=Báo mã loại lỗi cho hỗ trợ; giữ nguyên bằng chứng và không tự thay guard. "
+        "Log không kết luận độ phủ nguồn hoặc điều kiện pháp lý.")
+    return _bound_error_log_text("\n".join(lines) + "\n")
+
+
 def _cap_diagnostic_utf8(diagnostic: str, max_bytes: int = 4096) -> str:
     """Ensure diagnostic string encodes to <= max_bytes in UTF-8, truncated at a valid codepoint boundary."""
     raw = str(diagnostic).encode("utf-8", errors="replace")
